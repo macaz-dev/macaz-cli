@@ -8,9 +8,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/macaz-dev/macaz-cli/internal/config"
+	"github.com/macaz-dev/macaz-cli/internal/provider"
 )
 
 type fakeClaudeReport struct {
@@ -19,6 +21,19 @@ type fakeClaudeReport struct {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("MACAZ_FAKE_CODEX") == "1" {
+		report := fakeClaudeReport{
+			Args: append([]string(nil), os.Args[1:]...),
+			Environment: map[string]string{
+				"CODEX_HOME":          os.Getenv("CODEX_HOME"),
+				"MACAZ_GATEWAY_TOKEN": os.Getenv("MACAZ_GATEWAY_TOKEN"),
+				"MACAZ_ACTIVE":        os.Getenv("MACAZ_ACTIVE"),
+			},
+		}
+		raw, _ := json.Marshal(report)
+		_ = os.WriteFile(os.Getenv("MACAZ_FAKE_CODEX_REPORT"), raw, 0o600)
+		os.Exit(0)
+	}
 	if os.Getenv("MACAZ_FAKE_CLAUDE") == "1" {
 		if len(os.Args) >= 3 && os.Args[1] == "daemon" && os.Args[2] == "stop" {
 			os.Exit(0)
@@ -69,6 +84,130 @@ func TestMain(m *testing.M) {
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
+}
+
+func TestCodexUsesIsolatedOfficialProfileAndMappedModelCatalog(t *testing.T) {
+	root := t.TempDir()
+	reportPath := filepath.Join(root, "report.json")
+	sourceProfile := filepath.Join(root, "source-codex")
+	if err := os.MkdirAll(filepath.Join(sourceProfile, "skills"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceProfile, "config.toml"), []byte("personality = \"pragmatic\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceProfile, "skills", "example.md"), []byte("skill"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MACAZ_CONFIG", filepath.Join(root, "macaz", "config.json"))
+	t.Setenv("CODEX_HOME", sourceProfile)
+	t.Setenv("MACAZ_FAKE_CODEX", "1")
+	t.Setenv("MACAZ_FAKE_CODEX_REPORT", reportPath)
+	cfg := config.Default()
+	cfg.CodexExecutable = os.Args[0]
+	models := []string{"macaz-primary-a1", "macaz-secondary-b2"}
+	if err := Codex(context.Background(), cfg, Options{
+		BaseURL:      "http://127.0.0.1:54321",
+		Token:        "loopback-secret",
+		Models:       models,
+		DefaultModel: models[0],
+		ModelDetails: []provider.Model{
+			{ID: models[0], DisplayName: "Primary", Description: "Primary routed model", Default: true, Efforts: []string{"low", "high"}, InputModalities: []string{"text", "image"}, ContextWindow: 128000},
+			{ID: models[1], DisplayName: "Secondary", Efforts: []string{"medium"}, InputModalities: []string{"text"}, ContextWindow: 64000},
+		},
+		Args: []string{"exec", "hello"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report fakeClaudeReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Args) < 2 || !slices.Equal(report.Args[len(report.Args)-2:], []string{"exec", "hello"}) {
+		t.Fatalf("client args = %#v", report.Args)
+	}
+	joinedArgs := strings.Join(report.Args, "\n")
+	for _, required := range []string{
+		`model="macaz-primary-a1"`, `model_provider="macaz"`,
+		`model_catalog_json=`, `model_reasoning_effort="high"`,
+		`model_providers.macaz.base_url="http://127.0.0.1:54321/v1"`,
+		`model_providers.macaz.wire_api="responses"`, `web_search="disabled"`,
+	} {
+		if !strings.Contains(joinedArgs, required) {
+			t.Fatalf("runtime arguments are missing %q: %#v", required, report.Args)
+		}
+	}
+	if strings.Contains(joinedArgs, "--profile") {
+		t.Fatalf("Codex still depends on a named profile: %#v", report.Args)
+	}
+	if report.Environment["MACAZ_GATEWAY_TOKEN"] != "loopback-secret" || report.Environment["MACAZ_ACTIVE"] != "1" {
+		t.Fatalf("environment = %#v", report.Environment)
+	}
+	profileDir := report.Environment["CODEX_HOME"]
+	if profileDir == "" || profileDir == sourceProfile {
+		t.Fatalf("isolated CODEX_HOME = %q", profileDir)
+	}
+	if strings.Contains(joinedArgs, "loopback-secret") {
+		t.Fatalf("local token leaked into arguments: %#v", report.Args)
+	}
+	if _, err := os.Stat(filepath.Join(profileDir, "macaz.config.toml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete named profile still exists: %v", err)
+	}
+	if copied, err := os.ReadFile(filepath.Join(profileDir, "config.toml")); err != nil || string(copied) != "personality = \"pragmatic\"\n" {
+		t.Fatalf("base config copy = %q, error = %v", copied, err)
+	}
+	if _, err := os.Stat(filepath.Join(profileDir, "skills", "example.md")); err != nil {
+		t.Fatalf("shared Codex skills: %v", err)
+	}
+	catalogRaw, err := os.ReadFile(filepath.Join(profileDir, "macaz-models.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(catalogRaw, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 2 || catalog.Models[0]["slug"] != models[0] || catalog.Models[0]["display_name"] != "Primary" || catalog.Models[0]["context_window"] != float64(128000) {
+		t.Fatalf("catalog = %#v", catalog.Models)
+	}
+	if got := catalog.Models[0]["input_modalities"]; !slices.Equal(got.([]any), []any{"text", "image"}) {
+		t.Fatalf("input modalities = %#v", got)
+	}
+}
+
+func TestCodexInputModalitiesExcludeUnsupportedProviderKinds(t *testing.T) {
+	got := codexInputModalities([]string{"text", "document", "image", "audio", "IMAGE"})
+	if !slices.Equal(got, []string{"text", "image"}) {
+		t.Fatalf("modalities = %#v", got)
+	}
+}
+
+func TestCodexGatewayArgsFailClosed(t *testing.T) {
+	options := Options{BaseURL: "http://127.0.0.1:1234", DefaultModel: "macaz-default"}
+	for _, args := range [][]string{
+		{"--model", "gpt-native"},
+		{"--profile", "other"},
+		{"--oss"},
+		{"-c", "model_provider=other"},
+		{"--config=model_catalog_json=/tmp/other.json"},
+	} {
+		if _, err := codexGatewayArgs(args, options, "/tmp/macaz-models.json", "high"); err == nil {
+			t.Fatalf("gateway override was accepted: %#v", args)
+		}
+	}
+	args, err := codexGatewayArgs([]string{"--dangerously-bypass-approvals-and-sandbox", "exec", "hello"}, options, "/tmp/macaz-models.json", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(args, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Fatalf("explicit permission override was dropped: %#v", args)
+	}
 }
 
 func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T) {

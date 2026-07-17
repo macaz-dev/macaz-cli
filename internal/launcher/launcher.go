@@ -16,12 +16,14 @@ import (
 	"golang.org/x/term"
 
 	"github.com/macaz-dev/macaz-cli/internal/config"
+	"github.com/macaz-dev/macaz-cli/internal/provider"
 )
 
 type Options struct {
 	BaseURL      string
 	Token        string
 	Models       []string
+	ModelDetails []provider.Model
 	DefaultModel string
 	Args         []string
 	Stdin        io.Reader

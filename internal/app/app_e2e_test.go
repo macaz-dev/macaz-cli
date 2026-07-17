@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -105,7 +106,7 @@ func TestRunClaudeEndToEndWithLocalCLIProviders(t *testing.T) {
 			var stderr bytes.Buffer
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			if err := Run(ctx, nil, Streams{
+			if err := Run(ctx, []string{"claude"}, Streams{
 				In:  strings.NewReader(""),
 				Out: &stdout,
 				Err: &stderr,
@@ -127,7 +128,7 @@ func TestRunClaudeEndToEndWithLocalCLIProviders(t *testing.T) {
 			if report.BaseURL == "" || !strings.HasPrefix(report.BaseURL, "http://127.0.0.1:") {
 				t.Fatalf("gateway URL = %q", report.BaseURL)
 			}
-			if !strings.HasPrefix(report.Model, "claude-macaz-fake-default-") {
+			if report.Model != "claude-macaz-fake-default" {
 				t.Fatalf("public model = %q", report.Model)
 			}
 			if report.ResponseModel != report.Model {
@@ -274,7 +275,7 @@ func TestRunClaudeEndToEndWithHTTPProviders(t *testing.T) {
 			var output bytes.Buffer
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			if err := Run(ctx, nil, Streams{
+			if err := Run(ctx, []string{"claude"}, Streams{
 				In:  strings.NewReader(""),
 				Out: &output,
 				Err: &output,
@@ -314,6 +315,264 @@ func TestRunClaudeEndToEndWithHTTPProviders(t *testing.T) {
 				t.Fatalf("gateway still accepted requests after Claude exited: HTTP %d", response.StatusCode)
 			}
 		})
+	}
+}
+
+func TestRunCodexEndToEndWithOpenRouter(t *testing.T) {
+	codexPath, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("Codex CLI is not installed")
+	}
+	var captured []map[string]any
+	writeFunctionCall := func(w http.ResponseWriter, responseID, itemID, callID, name, arguments string) {
+		item := map[string]any{
+			"type": "function_call", "id": itemID, "call_id": callID,
+			"name": name, "arguments": arguments, "status": "completed",
+		}
+		itemRaw, _ := json.Marshal(item)
+		argumentsRaw, _ := json.Marshal(arguments)
+		_, _ = fmt.Fprintf(w,
+			"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":%q,\"model\":\"gpt-codex-e2e\"}}\n\n"+
+				"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":%q,\"call_id\":%q,\"name\":%q,\"arguments\":\"\"}}\n\n"+
+				"event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":%q,\"delta\":%s}\n\n"+
+				"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":%s}\n\n"+
+				"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":%q,\"model\":\"gpt-codex-e2e\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n",
+			responseID, itemID, callID, name, itemID, argumentsRaw, itemRaw, responseID,
+		)
+	}
+	hasTool := func(body map[string]any, name string) bool {
+		tools, _ := body["tools"].([]any)
+		for _, raw := range tools {
+			tool, _ := raw.(map[string]any)
+			if tool["name"] == name {
+				return true
+			}
+		}
+		return false
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer codex-e2e-key" {
+			http.Error(w, "missing API key", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/key":
+			_, _ = io.WriteString(w, `{"data":{"label":"codex-e2e"}}`)
+		case "/v1/models":
+			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-codex-e2e","name":"Codex E2E","created":1,"context_length":200000,"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"top_provider":{"max_completion_tokens":32000},"supported_parameters":["tools","tool_choice","reasoning_effort"],"reasoning":{"supported_efforts":["low","high"]}}]}`)
+		case "/v1/responses":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			captured = append(captured, body)
+			if body["model"] != "gpt-codex-e2e" {
+				http.Error(w, fmt.Sprintf("unexpected model: %#v", body["model"]), http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			switch len(captured) {
+			case 1:
+				if !hasTool(body, "apply_patch") {
+					http.Error(w, "Codex apply_patch tool was not translated", http.StatusBadRequest)
+					return
+				}
+				writeFunctionCall(w, "resp_patch", "fc_patch", "call_patch", "apply_patch",
+					`{"input":"*** Begin Patch\n*** Add File: macaz-tool-e2e.txt\n+MACAZ_CUSTOM_TOOL_OK\n*** End Patch"}`)
+			case 2:
+				if !hasTool(body, "exec_command") {
+					http.Error(w, "Codex exec_command tool was not translated", http.StatusBadRequest)
+					return
+				}
+				writeFunctionCall(w, "resp_exec", "fc_exec", "call_exec", "exec_command", `{"cmd":"printf MACAZ_FUNCTION_TOOL_OK"}`)
+			default:
+				conversation, _ := json.Marshal(body["input"])
+				if !bytes.Contains(conversation, []byte("call_exec")) || !bytes.Contains(conversation, []byte("MACAZ_FUNCTION_TOOL_OK")) {
+					http.Error(w, "Codex did not execute the function tool: "+string(conversation), http.StatusBadRequest)
+					return
+				}
+				_, _ = io.WriteString(w,
+					"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_codex_e2e\",\"model\":\"gpt-codex-e2e\"}}\n\n"+
+						"event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"msg_codex_e2e\"}}\n\n"+
+						"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_codex_e2e\",\"delta\":\"MACAZ_CODEX_E2E_OK\"}\n\n"+
+						"event: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_codex_e2e\"}}\n\n"+
+						"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_codex_e2e\",\"model\":\"gpt-codex-e2e\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}}\n\n",
+				)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MACAZ_CONFIG", filepath.Join(root, "macaz", "config.json"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "normal-codex"))
+	t.Setenv("OPENROUTER_API_KEY", "codex-e2e-key")
+	t.Setenv("MACAZ_NO_UPDATE_CHECK", "1")
+	if err := os.MkdirAll(os.Getenv("CODEX_HOME"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.CodexExecutable = codexPath
+	selected := cfg
+	selected.Provider = config.ProviderOpenRouterAPI
+	selected.OpenRouterBaseURL = upstream.URL + "/v1"
+	selected.OpenRouterModel = "gpt-codex-e2e"
+	selected.ModelMap = map[string]string{"default": "gpt-codex-e2e"}
+	cfg.SetClient(config.ClientCodex, selected)
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = Run(ctx, []string{"codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "-C", workspace, "--skip-git-repo-check", "Use the requested tools, then reply with the provided final text."}, Streams{
+		In: strings.NewReader(""), Out: &stdout, Err: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("run Codex through macaz: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "MACAZ_CODEX_E2E_OK") {
+		t.Fatalf("Codex output did not contain gateway response\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if len(captured) < 3 {
+		t.Fatalf("Codex completed only %d Responses turns, want custom tool, namespace tool, and final response", len(captured))
+	}
+	created, err := os.ReadFile(filepath.Join(workspace, "macaz-tool-e2e.txt"))
+	if err != nil || string(created) != "MACAZ_CUSTOM_TOOL_OK\n" {
+		t.Fatalf("Codex custom apply_patch result = %q, error = %v", created, err)
+	}
+	conversation, _ := json.Marshal(captured[len(captured)-1]["input"])
+	for _, marker := range []string{"call_patch", "call_exec", "MACAZ_FUNCTION_TOOL_OK", "function_call_output"} {
+		if !bytes.Contains(conversation, []byte(marker)) {
+			t.Fatalf("final Codex conversation is missing %q: %s", marker, conversation)
+		}
+	}
+}
+
+func TestRunCodexEndToEndWithAnthropicAPI(t *testing.T) {
+	codexPath, err := exec.LookPath("codex")
+	if err != nil {
+		t.Skip("Codex CLI is not installed")
+	}
+	var messageCalls int
+	var captured []map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-api-key") != "anthropic-codex-e2e-key" || r.Header.Get("anthropic-version") == "" {
+			http.Error(w, "missing Anthropic authentication", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = io.WriteString(w, `{"data":[{"id":"claude-codex-e2e","display_name":"Claude Codex E2E","created_at":"2026-07-17T00:00:00Z"}],"has_more":false}`)
+		case "/v1/messages":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			captured = append(captured, body)
+			messageCalls++
+			if body["model"] != "claude-codex-e2e" || body["stream"] != true {
+				http.Error(w, fmt.Sprintf("unexpected Anthropic request: %#v", body), http.StatusBadRequest)
+				return
+			}
+			if maxTokens, _ := body["max_tokens"].(float64); maxTokens <= 0 {
+				http.Error(w, "Anthropic max_tokens was not populated", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			if messageCalls == 1 {
+				tools, _ := body["tools"].([]any)
+				foundApplyPatch := false
+				for _, raw := range tools {
+					tool, _ := raw.(map[string]any)
+					if tool["name"] == "apply_patch" {
+						foundApplyPatch = true
+					}
+				}
+				if !foundApplyPatch {
+					http.Error(w, "Codex apply_patch was not translated to an Anthropic tool", http.StatusBadRequest)
+					return
+				}
+				_, _ = io.WriteString(w,
+					"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_anthropic_patch\",\"model\":\"claude-codex-e2e\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"+
+						"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_anthropic_patch\",\"name\":\"apply_patch\",\"input\":{}}}\n\n"+
+						"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"*** Begin Patch\\\\n*** Add File: macaz-anthropic-e2e.txt\\\\n+MACAZ_ANTHROPIC_TOOL_OK\\\\n*** End Patch\\\"}\"}}\n\n"+
+						"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"+
+						"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":5}}\n\n"+
+						"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+				)
+				return
+			}
+			messagesRaw, _ := json.Marshal(body["messages"])
+			if !bytes.Contains(messagesRaw, []byte("call_anthropic_patch")) || !bytes.Contains(messagesRaw, []byte("tool_result")) {
+				http.Error(w, "Anthropic follow-up omitted Codex tool result: "+string(messagesRaw), http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w,
+				"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_anthropic_final\",\"model\":\"claude-codex-e2e\",\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}\n\n"+
+					"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"+
+					"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"MACAZ_CODEX_ANTHROPIC_E2E_OK\"}}\n\n"+
+					"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"+
+					"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":8}}\n\n"+
+					"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	if err := os.MkdirAll(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MACAZ_CONFIG", filepath.Join(root, "macaz", "config.json"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "normal-codex"))
+	t.Setenv("ANTHROPIC_API_KEY", "anthropic-codex-e2e-key")
+	t.Setenv("MACAZ_NO_UPDATE_CHECK", "1")
+	if err := os.MkdirAll(os.Getenv("CODEX_HOME"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.CodexExecutable = codexPath
+	selected := cfg
+	selected.Provider = config.ProviderAnthropicAPI
+	selected.AnthropicBaseURL = upstream.URL + "/v1"
+	selected.AnthropicModel = "claude-codex-e2e"
+	selected.ModelMap = map[string]string{"default": "claude-codex-e2e"}
+	cfg.SetClient(config.ClientCodex, selected)
+	if err := config.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = Run(ctx, []string{"codex", "exec", "--ephemeral", "--sandbox", "workspace-write", "-C", workspace, "--skip-git-repo-check", "Use the requested tool, then print the provided final text."}, Streams{
+		In: strings.NewReader(""), Out: &stdout, Err: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("run Codex through Anthropic API: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "MACAZ_CODEX_ANTHROPIC_E2E_OK") {
+		t.Fatalf("Codex output omitted Anthropic response\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	created, err := os.ReadFile(filepath.Join(workspace, "macaz-anthropic-e2e.txt"))
+	if err != nil || string(created) != "MACAZ_ANTHROPIC_TOOL_OK\n" {
+		t.Fatalf("Codex/Anthropic apply_patch result = %q, error = %v", created, err)
+	}
+	if messageCalls < 2 || len(captured) < 2 {
+		t.Fatalf("Anthropic received %d message calls, want tool call and follow-up", messageCalls)
 	}
 }
 
@@ -413,7 +672,7 @@ func TestRunClaudeEndToEndWithOpenAISubscription(t *testing.T) {
 	var output bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Run(ctx, nil, Streams{
+	if err := Run(ctx, []string{"claude"}, Streams{
 		In:  strings.NewReader(""),
 		Out: &output,
 		Err: &output,

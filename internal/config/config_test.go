@@ -19,7 +19,11 @@ func TestSaveLoadPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Provider != ProviderCodexCLI || got.CodexExecutable != "wcodex" {
+	claude, err := got.ForClient(ClientClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claude.Provider != ProviderCodexCLI || got.CodexExecutable != "wcodex" {
 		t.Fatalf("unexpected config: %#v", got)
 	}
 	if info, err := os.Stat(path); err != nil {
@@ -46,8 +50,91 @@ func TestSavePathReplacesExistingConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Provider != ProviderOpenCodeCLI || loaded.OpenCodeModel != "fake/next" {
+	claude, err := loaded.ForClient(ClientClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claude.Provider != ProviderOpenCodeCLI || claude.OpenCodeModel != "fake/next" {
 		t.Fatalf("loaded = %#v", loaded)
+	}
+}
+
+func TestClientProfilesAreIndependentAndLegacyConfigMigrates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{
+  "version": 1,
+  "provider": "openrouter-api",
+  "openrouter_model": "legacy/model",
+  "model_map": {"default":"legacy/model"}
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claude, err := cfg.ForClient(ClientClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Version != 2 || claude.Provider != ProviderOpenRouterAPI || claude.ResolveModel("default") != "legacy/model" {
+		t.Fatalf("migrated config = %#v", cfg)
+	}
+	codex := cfg
+	codex.Provider = ProviderAnthropicAPI
+	codex.AnthropicModel = "claude-test"
+	codex.CodexExecutable = "codex-custom"
+	codex.OpenCodeExecutable = "opencode-custom"
+	codex.ModelMap = map[string]string{"default": "claude-test"}
+	cfg.SetClient(ClientCodex, codex)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := cfg.ForClient(ClientCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Provider != ProviderAnthropicAPI || selected.ResolveModel("default") != "claude-test" {
+		t.Fatalf("Codex config = %#v", selected)
+	}
+	if cfg.CodexExecutable != "codex-custom" || cfg.OpenCodeExecutable != "opencode-custom" {
+		t.Fatalf("client executables were not persisted: %#v", cfg)
+	}
+	claude, _ = cfg.ForClient(ClientClaude)
+	if claude.Provider != ProviderOpenRouterAPI || claude.ResolveModel("default") != "legacy/model" {
+		t.Fatalf("Claude config changed = %#v", claude)
+	}
+}
+
+func TestCodexClientRejectsRecursiveCodexCLIProvider(t *testing.T) {
+	cfg := Default()
+	selected := cfg
+	selected.Provider = ProviderCodexCLI
+	cfg.SetClient(ClientCodex, selected)
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Codex client accepted Codex CLI as its upstream")
+	}
+}
+
+func TestClientProfilesRejectRedundantDirectProviders(t *testing.T) {
+	tests := []struct {
+		client   string
+		provider string
+	}{
+		{client: ClientClaude, provider: ProviderAnthropicAPI},
+		{client: ClientCodex, provider: ProviderOpenAISubscription},
+		{client: ClientCodex, provider: ProviderOpenAIAPIKey},
+	}
+	for _, test := range tests {
+		t.Run(test.client+"-"+test.provider, func(t *testing.T) {
+			cfg := Default()
+			selected := cfg
+			selected.Provider = test.provider
+			cfg.SetClient(test.client, selected)
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("%s client accepted redundant provider %s", test.client, test.provider)
+			}
+		})
 	}
 }
 

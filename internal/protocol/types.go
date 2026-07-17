@@ -8,7 +8,7 @@ import (
 
 type Request struct {
 	Model             string          `json:"model"`
-	MaxTokens         int             `json:"max_tokens"`
+	MaxTokens         int             `json:"max_tokens,omitempty"`
 	Messages          []Message       `json:"messages"`
 	System            json.RawMessage `json:"system,omitempty"`
 	Tools             []Tool          `json:"tools,omitempty"`
@@ -36,6 +36,13 @@ type Tool struct {
 	Description  string         `json:"description,omitempty"`
 	InputSchema  map[string]any `json:"input_schema,omitempty"`
 	DeferLoading bool           `json:"defer_loading,omitempty"`
+	// ClientType records the caller-facing Responses tool kind without leaking
+	// that kind into provider-native tool payloads. In particular, Codex custom
+	// tools are represented upstream as an ordinary tool whose JSON input has a
+	// single string field named "input".
+	ClientType      string `json:"-"`
+	ClientName      string `json:"-"`
+	ClientNamespace string `json:"-"`
 }
 
 type Source struct {

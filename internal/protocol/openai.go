@@ -166,6 +166,74 @@ func ApplyToolPolicy(tools []Tool, policy ToolPolicy) ([]Tool, error) {
 	}
 }
 
+// PrepareNativeToolRequest makes client-owned tools safe for a provider-native
+// Messages request. It applies tool_choice, normalizes names to the portable
+// function-name grammar, and rewrites assistant tool history consistently.
+func PrepareNativeToolRequest(request *Request) (*Request, *ToolNames, error) {
+	clientTools, err := ClientTools(request.Tools)
+	if err != nil {
+		return nil, nil, err
+	}
+	policy, err := ParseToolPolicy(request.ToolChoice)
+	if err != nil {
+		return nil, nil, err
+	}
+	selected, err := ApplyToolPolicy(clientTools, policy)
+	if err != nil {
+		return nil, nil, err
+	}
+	names := NewToolNames(clientTools)
+	prepared := *request
+	prepared.Tools = append([]Tool(nil), selected...)
+	for index := range prepared.Tools {
+		prepared.Tools[index].Name = names.Provider(prepared.Tools[index].Name)
+	}
+	prepared.Messages = append([]Message(nil), request.Messages...)
+	for index := range prepared.Messages {
+		if strings.ToLower(strings.TrimSpace(prepared.Messages[index].Role)) != "assistant" {
+			continue
+		}
+		blocks, err := DecodeBlocks(prepared.Messages[index].Content)
+		if err != nil {
+			return nil, nil, err
+		}
+		changed := false
+		for blockIndex := range blocks {
+			if blocks[blockIndex].Type == "tool_use" {
+				blocks[blockIndex].Name = names.Provider(blocks[blockIndex].Name)
+				changed = true
+			}
+		}
+		if changed {
+			prepared.Messages[index].Content, err = json.Marshal(blocks)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	if len(prepared.Tools) == 0 {
+		prepared.ToolChoice = nil
+	} else {
+		switch policy.Type {
+		case "none":
+			prepared.ToolChoice = nil
+		case "tool":
+			prepared.ToolChoice, err = json.Marshal(map[string]any{
+				"type": "tool", "name": names.Provider(policy.Name),
+				"disable_parallel_tool_use": policy.DisableParallel,
+			})
+		default:
+			prepared.ToolChoice, err = json.Marshal(map[string]any{
+				"type": policy.Type, "disable_parallel_tool_use": policy.DisableParallel,
+			})
+		}
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return &prepared, names, nil
+}
+
 func ToResponses(req *Request, model, defaultEffort string) (ResponsesRequest, error) {
 	instructions, err := SystemText(req.System)
 	if err != nil {

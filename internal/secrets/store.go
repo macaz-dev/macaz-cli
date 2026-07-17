@@ -14,6 +14,7 @@ const service = "github.com/macaz-dev/macaz-cli"
 const (
 	OpenAIAPIKey     = "openai-api-key"
 	OpenRouterAPIKey = "openrouter-api-key"
+	AnthropicAPIKey  = "anthropic-api-key"
 	OpenAIAccount    = "openai-subscription"
 )
 
@@ -82,7 +83,7 @@ func Delete(name string) error {
 
 func DeleteAll() error {
 	var joined error
-	for _, name := range []string{OpenAIAPIKey, OpenRouterAPIKey, OpenAIAccount} {
+	for _, name := range []string{OpenAIAPIKey, OpenRouterAPIKey, AnthropicAPIKey, OpenAIAccount} {
 		joined = errors.Join(joined, Delete(name))
 	}
 	return joined

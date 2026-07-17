@@ -11,34 +11,57 @@ import (
 )
 
 const (
+	ClientClaude = "claude"
+	ClientCodex  = "codex"
+
 	ProviderOpenAISubscription = "openai-subscription"
 	ProviderOpenAIAPIKey       = "openai-api-key"
 	ProviderOpenRouterAPI      = "openrouter-api"
+	ProviderAnthropicAPI       = "anthropic-api"
 	ProviderCodexCLI           = "codex-cli"
 	ProviderOpenCodeCLI        = "opencode-cli"
 )
 
+type ClientProfile struct {
+	Provider          string            `json:"provider"`
+	OpenAIBaseURL     string            `json:"openai_base_url,omitempty"`
+	OpenAIModel       string            `json:"openai_model,omitempty"`
+	OpenRouterBaseURL string            `json:"openrouter_base_url,omitempty"`
+	OpenRouterModel   string            `json:"openrouter_model,omitempty"`
+	AnthropicBaseURL  string            `json:"anthropic_base_url,omitempty"`
+	AnthropicModel    string            `json:"anthropic_model,omitempty"`
+	OpenCodeModel     string            `json:"opencode_model,omitempty"`
+	DefaultEffort     string            `json:"default_effort,omitempty"`
+	ModelMap          map[string]string `json:"model_map,omitempty"`
+}
+
 type Config struct {
-	Version            int               `json:"version"`
-	Provider           string            `json:"provider"`
-	ClaudeExecutable   string            `json:"claude_executable,omitempty"`
-	CodexExecutable    string            `json:"codex_executable,omitempty"`
-	OpenCodeExecutable string            `json:"opencode_executable,omitempty"`
-	CodexHome          string            `json:"codex_home,omitempty"`
-	OpenAIBaseURL      string            `json:"openai_base_url,omitempty"`
-	OpenAIModel        string            `json:"openai_model,omitempty"`
-	OpenRouterBaseURL  string            `json:"openrouter_base_url,omitempty"`
-	OpenRouterModel    string            `json:"openrouter_model,omitempty"`
-	OpenCodeModel      string            `json:"opencode_model,omitempty"`
-	DefaultEffort      string            `json:"default_effort,omitempty"`
-	ModelMap           map[string]string `json:"model_map,omitempty"`
-	RequestTimeoutSec  int               `json:"request_timeout_seconds,omitempty"`
-	MaxBodyBytes       int64             `json:"max_body_bytes,omitempty"`
+	Version            int                      `json:"version"`
+	DefaultClient      string                   `json:"default_client,omitempty"`
+	Clients            map[string]ClientProfile `json:"clients,omitempty"`
+	Provider           string                   `json:"provider,omitempty"`
+	ClaudeExecutable   string                   `json:"claude_executable,omitempty"`
+	CodexExecutable    string                   `json:"codex_executable,omitempty"`
+	OpenCodeExecutable string                   `json:"opencode_executable,omitempty"`
+	CodexHome          string                   `json:"codex_home,omitempty"`
+	OpenAIBaseURL      string                   `json:"openai_base_url,omitempty"`
+	OpenAIModel        string                   `json:"openai_model,omitempty"`
+	OpenRouterBaseURL  string                   `json:"openrouter_base_url,omitempty"`
+	OpenRouterModel    string                   `json:"openrouter_model,omitempty"`
+	AnthropicBaseURL   string                   `json:"anthropic_base_url,omitempty"`
+	AnthropicModel     string                   `json:"anthropic_model,omitempty"`
+	OpenCodeModel      string                   `json:"opencode_model,omitempty"`
+	DefaultEffort      string                   `json:"default_effort,omitempty"`
+	ModelMap           map[string]string        `json:"model_map,omitempty"`
+	RequestTimeoutSec  int                      `json:"request_timeout_seconds,omitempty"`
+	MaxBodyBytes       int64                    `json:"max_body_bytes,omitempty"`
 }
 
 func Default() Config {
 	return Config{
-		Version:            1,
+		Version:            2,
+		DefaultClient:      ClientClaude,
+		Clients:            map[string]ClientProfile{},
 		ClaudeExecutable:   "claude",
 		CodexExecutable:    "codex",
 		OpenCodeExecutable: "opencode",
@@ -46,6 +69,8 @@ func Default() Config {
 		OpenAIModel:        "gpt-5.6",
 		OpenRouterBaseURL:  "https://openrouter.ai/api/v1",
 		OpenRouterModel:    "openai/gpt-5.6-sol",
+		AnthropicBaseURL:   "https://api.anthropic.com/v1",
+		AnthropicModel:     "",
 		DefaultEffort:      "high",
 		ModelMap: map[string]string{
 			"default": "gpt-5.6",
@@ -90,6 +115,9 @@ func LoadPath(path string) (Config, error) {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
 	cfg.applyDefaults()
+	if len(cfg.Clients) == 0 && strings.TrimSpace(cfg.Provider) != "" {
+		cfg.SetClient(ClientClaude, cfg)
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -150,20 +178,39 @@ func WritePrivateJSON(path string, value any) error {
 }
 
 func ClaudeProfileDir() (string, error) {
+	return ClientProfileDir(ClientClaude)
+}
+
+func CodexProfileDir() (string, error) {
+	return ClientProfileDir(ClientCodex)
+}
+
+func ClientProfileDir(client string) (string, error) {
+	if err := ValidateClient(client); err != nil {
+		return "", err
+	}
 	path, err := Path()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(path), "claude"), nil
+	return filepath.Join(filepath.Dir(path), client), nil
 }
 
 func RemoveClaudeProfile() error {
-	path, err := ClaudeProfileDir()
+	return RemoveClientProfile(ClientClaude)
+}
+
+func RemoveCodexProfile() error {
+	return RemoveClientProfile(ClientCodex)
+}
+
+func RemoveClientProfile(client string) error {
+	path, err := ClientProfileDir(client)
 	if err != nil {
 		return err
 	}
 	if err := os.RemoveAll(path); err != nil {
-		return fmt.Errorf("remove Claude profile: %w", err)
+		return fmt.Errorf("remove %s profile: %w", client, err)
 	}
 	return nil
 }
@@ -184,6 +231,12 @@ func (c *Config) applyDefaults() {
 	d := Default()
 	if c.Version == 0 {
 		c.Version = d.Version
+	}
+	if strings.TrimSpace(c.DefaultClient) == "" {
+		c.DefaultClient = d.DefaultClient
+	}
+	if c.Clients == nil {
+		c.Clients = map[string]ClientProfile{}
 	}
 	if strings.TrimSpace(c.ClaudeExecutable) == "" {
 		c.ClaudeExecutable = d.ClaudeExecutable
@@ -206,6 +259,12 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.OpenRouterModel) == "" {
 		c.OpenRouterModel = d.OpenRouterModel
 	}
+	if strings.TrimSpace(c.AnthropicBaseURL) == "" {
+		c.AnthropicBaseURL = d.AnthropicBaseURL
+	}
+	if strings.TrimSpace(c.AnthropicModel) == "" {
+		c.AnthropicModel = d.AnthropicModel
+	}
 	if strings.TrimSpace(c.DefaultEffort) == "" {
 		c.DefaultEffort = d.DefaultEffort
 	}
@@ -226,10 +285,27 @@ func (c *Config) applyDefaults() {
 }
 
 func (c Config) Validate() error {
-	switch c.Provider {
-	case "", ProviderOpenAISubscription, ProviderOpenAIAPIKey, ProviderOpenRouterAPI, ProviderCodexCLI, ProviderOpenCodeCLI:
-	default:
-		return fmt.Errorf("unsupported provider %q", c.Provider)
+	if err := ValidateClient(c.DefaultClient); err != nil {
+		return err
+	}
+	if err := validateProvider(c.Provider); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Provider) != "" {
+		if err := validateClientProvider(ClientClaude, c.Provider); err != nil {
+			return err
+		}
+	}
+	for client, profile := range c.Clients {
+		if err := ValidateClient(client); err != nil {
+			return err
+		}
+		if err := validateProvider(profile.Provider); err != nil {
+			return fmt.Errorf("%s client: %w", client, err)
+		}
+		if err := validateClientProvider(client, profile.Provider); err != nil {
+			return err
+		}
 	}
 	switch c.DefaultEffort {
 	case "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
@@ -243,6 +319,129 @@ func (c Config) Validate() error {
 		return errors.New("max body bytes must be at least 1024")
 	}
 	return nil
+}
+
+func validateClientProvider(client, provider string) error {
+	switch {
+	case client == ClientClaude && provider == ProviderAnthropicAPI:
+		return errors.New("claude client does not need macaz to use the Anthropic API")
+	case client == ClientCodex && (provider == ProviderOpenAISubscription || provider == ProviderOpenAIAPIKey):
+		return errors.New("codex client does not need macaz to use OpenAI")
+	case client == ClientCodex && provider == ProviderCodexCLI:
+		return errors.New("codex client cannot use Codex CLI as its upstream provider")
+	default:
+		return nil
+	}
+}
+
+func ValidateClient(client string) error {
+	switch strings.ToLower(strings.TrimSpace(client)) {
+	case ClientClaude, ClientCodex:
+		return nil
+	default:
+		return fmt.Errorf("unsupported client %q", client)
+	}
+}
+
+func validateProvider(name string) error {
+	switch name {
+	case "", ProviderOpenAISubscription, ProviderOpenAIAPIKey, ProviderOpenRouterAPI, ProviderAnthropicAPI, ProviderCodexCLI, ProviderOpenCodeCLI:
+		return nil
+	default:
+		return fmt.Errorf("unsupported provider %q", name)
+	}
+}
+
+func (c Config) HasClient(client string) bool {
+	client = strings.ToLower(strings.TrimSpace(client))
+	if profile, ok := c.Clients[client]; ok && strings.TrimSpace(profile.Provider) != "" {
+		return true
+	}
+	return client == ClientClaude && strings.TrimSpace(c.Provider) != ""
+}
+
+func (c Config) ForClient(client string) (Config, error) {
+	client = strings.ToLower(strings.TrimSpace(client))
+	if err := ValidateClient(client); err != nil {
+		return Config{}, err
+	}
+	result := c
+	profile, ok := c.Clients[client]
+	if !ok {
+		if client == ClientClaude && strings.TrimSpace(c.Provider) != "" {
+			return result, nil
+		}
+		result.Provider = ""
+		return result, nil
+	}
+	result.Provider = profile.Provider
+	result.OpenAIBaseURL = firstNonEmpty(profile.OpenAIBaseURL, result.OpenAIBaseURL)
+	result.OpenAIModel = firstNonEmpty(profile.OpenAIModel, result.OpenAIModel)
+	result.OpenRouterBaseURL = firstNonEmpty(profile.OpenRouterBaseURL, result.OpenRouterBaseURL)
+	result.OpenRouterModel = firstNonEmpty(profile.OpenRouterModel, result.OpenRouterModel)
+	result.AnthropicBaseURL = firstNonEmpty(profile.AnthropicBaseURL, result.AnthropicBaseURL)
+	result.AnthropicModel = firstNonEmpty(profile.AnthropicModel, result.AnthropicModel)
+	result.OpenCodeModel = profile.OpenCodeModel
+	result.DefaultEffort = firstNonEmpty(profile.DefaultEffort, result.DefaultEffort)
+	if profile.ModelMap != nil {
+		result.ModelMap = cloneStringMap(profile.ModelMap)
+	}
+	return result, nil
+}
+
+func (c *Config) SetClient(client string, selected Config) {
+	client = strings.ToLower(strings.TrimSpace(client))
+	if c.Clients == nil {
+		c.Clients = map[string]ClientProfile{}
+	}
+	c.Version = 2
+	c.ClaudeExecutable = selected.ClaudeExecutable
+	c.CodexExecutable = selected.CodexExecutable
+	c.OpenCodeExecutable = selected.OpenCodeExecutable
+	c.CodexHome = selected.CodexHome
+	c.Clients[client] = ClientProfile{
+		Provider:          selected.Provider,
+		OpenAIBaseURL:     selected.OpenAIBaseURL,
+		OpenAIModel:       selected.OpenAIModel,
+		OpenRouterBaseURL: selected.OpenRouterBaseURL,
+		OpenRouterModel:   selected.OpenRouterModel,
+		AnthropicBaseURL:  selected.AnthropicBaseURL,
+		AnthropicModel:    selected.AnthropicModel,
+		OpenCodeModel:     selected.OpenCodeModel,
+		DefaultEffort:     selected.DefaultEffort,
+		ModelMap:          cloneStringMap(selected.ModelMap),
+	}
+	if client == ClientClaude {
+		c.Provider = ""
+	}
+}
+
+func (c *Config) RemoveClient(client string) {
+	client = strings.ToLower(strings.TrimSpace(client))
+	delete(c.Clients, client)
+	if client == ClientClaude {
+		c.Provider = ""
+	}
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]string, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (c Config) ResolveModel(requested string) string {
@@ -273,6 +472,9 @@ func (c Config) ResolveModel(requested string) string {
 	}
 	if c.Provider == ProviderOpenCodeCLI && strings.TrimSpace(c.OpenCodeModel) != "" {
 		return c.OpenCodeModel
+	}
+	if c.Provider == ProviderAnthropicAPI && strings.TrimSpace(c.AnthropicModel) != "" {
+		return c.AnthropicModel
 	}
 	return c.OpenAIModel
 }

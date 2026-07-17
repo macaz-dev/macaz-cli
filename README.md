@@ -2,197 +2,226 @@
 
 [![CI](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml)
 
-macaz keeps Claude Code as the local coding client while routing model inference
-through OpenAI, OpenRouter, Codex CLI, or OpenCode CLI.
+**Use your favorite models and providers with your favorite coding agents.**
+
+macaz connects locally installed coding agents with a model provider chosen by
+the user. It starts Claude Code or Codex CLI and routes model interactions while
+the selected agent continues to own its local tools, permissions, sessions,
+skills, and user interface.
 
 macaz is free and open-source software licensed under Apache-2.0. Every build
-has the complete feature set.
+contains the complete feature set.
 
 > [!IMPORTANT]
 > macaz is an independent interoperability project. It is not affiliated with,
-> authorized by, endorsed by, or sponsored by Anthropic or any model provider.
-> Claude Code must be installed separately from an authorized source, and use
-> of Claude Code and each provider remains subject to their respective terms.
+> authorized by, endorsed by, or sponsored by Anthropic, OpenAI, or any other
+> client or model provider. Claude Code and Codex CLI are separate products that
+> must be obtained from their authorized sources. Each product and provider
+> remains subject to its own current terms.
 
-See the [legal and compatibility notice](LEGAL.md) and [privacy disclosure](PRIVACY.md)
-before use.
+Read [LEGAL.md](LEGAL.md) and [PRIVACY.md](PRIVACY.md) before use.
+
+## What it does
 
 ```text
-macaz
+macaz claude   # Claude Code through the selected provider
+macaz codex    # Codex CLI through the selected provider
 ```
 
-Claude still executes files, shell commands, edits, skills, MCP tools, hooks,
-images, attachments, and agents on your machine. macaz uses only a temporary
-authenticated loopback connection and preserves Claude's normal permission
-prompts by default.
+The two clients have independent provider/model configuration and isolated
+macaz profiles. For example, `macaz claude` can use an OpenAI model while
+`macaz codex` uses the official Anthropic API. `macaz reset codex` changes
+neither the Claude configuration nor shared provider credentials.
+
+The local routing layer translates both directions:
+
+- Anthropic Messages requests and streams used by Claude Code;
+- OpenAI Responses requests and streams used by Codex CLI;
+- text, images, supported document inputs, reasoning effort, usage, errors,
+  function tools, Codex custom/free-form tools, and tool namespaces; and
+- live provider model catalogs into each client's native `/model` interface.
+
+Client-executed tools stay in the client. Shell commands, file edits,
+`apply_patch`, skills, hooks, MCP tools, namespaced tools, and subagents are not
+executed by macaz or by an upstream CLI adapter. Normal client permission and
+sandbox behavior is preserved unless the user explicitly passes that client's
+own bypass option.
+
+Server-executed tools are different: a tool such as provider-hosted web
+search is available only when the selected provider exposes a compatible
+server implementation. macaz disables Codex's OpenAI-hosted web-search request
+for provider-neutral sessions rather than silently pretending another provider
+can execute it. Local function, custom, namespace, and MCP tools remain
+available.
+
+No translation can make different proprietary models semantically identical.
+The compatibility target is correct protocol and local-tool behavior without a
+hidden provider fallback.
 
 ## Install
 
-On macOS or Linux, install the latest GitHub release with:
+On macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/macaz-dev/macaz-cli/main/scripts/install.sh | sh
 ```
 
-The installer detects the platform, downloads the matching release binary,
-requires a matching entry in `SHA256SUMS`, verifies SHA-256, and installs to
-`$HOME/.local/bin` by default. Pin a release with `--version`:
+The installer selects the platform release, requires its entry in
+`SHA256SUMS`, verifies SHA-256, and installs to `$HOME/.local/bin` by default.
+Pin a release with `--version`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/macaz-dev/macaz-cli/main/scripts/install.sh |
-  sh -s -- --version 0.1.0
+  sh -s -- --version 0.2.0
 ```
 
-Windows binaries and all other release files are available from
+Windows binaries and other release files are published on
 [GitHub Releases](https://github.com/macaz-dev/macaz-cli/releases).
 
-To opt into Claude Code's full-permission mode:
+Install the latest release in place later with:
 
 ```text
-macaz --dangerously-skip-permissions
-```
-
-## Setup
-
-On first launch:
-
-```text
-1. OpenAI Subscription
-2. OpenAI API
-3. OpenRouter API
-4. Codex-CLI
-5. OpenCode-CLI
-```
-
-The selection is saved. API keys and OAuth credentials are stored in the
-operating-system credential store, not in `config.json`.
-
-Requirements:
-
-- Claude Code 2.1.211 or newer, with `claude` on `PATH`;
-- Codex CLI 0.144.5 or newer for Codex-CLI, or a compatible custom executable
-  such as `wcodex`;
-- OpenCode CLI 1.18.3 or newer for OpenCode-CLI, or a compatible custom
-  executable;
-- a browser for the normal OpenAI Subscription device authorization flow.
-
-OpenAI and OpenRouter setup ask for the API key. OpenAI Subscription displays a
-URL and code, opens the browser, waits for confirmation, validates the account,
-and only then starts Claude.
-
-## Commands
-
-```text
-macaz [claude arguments...]
-macaz status
-macaz doctor
-macaz reset
-macaz legal
 macaz update
-macaz version
 ```
 
-Release builds perform a short, best-effort check against the official GitHub
-Releases page on each start. If a newer stable release exists, macaz prints a
-notice to standard error but never installs it automatically. Network failures
-remain silent and do not prevent the requested command from running. Disable
-this check with:
+The updater downloads only the exact asset for the current platform, verifies
+the release checksums and embedded version, and replaces the executable with
+rollback protection. It does not send prompts, source code, configuration, or
+provider credentials.
+
+Release builds perform a short best-effort update check on startup. The check
+never installs automatically and does not block offline use. Disable it with:
 
 ```sh
 export MACAZ_NO_UPDATE_CHECK=1
 ```
 
-Install the latest release in place with:
+## Requirements
+
+- Go is needed only when building from source.
+- `claude` must be on `PATH` to use `macaz claude`.
+- `codex` must be on `PATH` to use `macaz codex`.
+- `opencode` is required only when OpenCode CLI is the selected provider.
+- A browser is used by the OpenAI Subscription authorization flow.
+
+Claude Code, Codex CLI, and OpenCode are not bundled or redistributed.
+
+## Setup and providers
+
+The first invocation of each client opens its own setup:
 
 ```text
-macaz update
+macaz claude
+macaz codex
 ```
 
-The updater downloads only the exact GitHub asset for the current operating
-system and architecture, requires its entry in `SHA256SUMS`, checks GitHub's
-asset digest when available, executes the staged binary to confirm its embedded
-version, and then replaces the current executable with rollback protection. It
-does not send configuration, credentials, prompts, or provider data. The user
-running macaz must have write permission to the installed binary's directory;
-otherwise, use the installer with suitable permissions.
+Available upstreams:
 
-Every provider-backed `macaz` start refreshes the provider catalog
-automatically, so newly available models appear in Claude's `/model` interface.
-Provider, model, and effort selection stay in the initial setup and Claude
-interface rather than adding duplicate macaz commands.
+| Provider | Claude client | Codex client |
+| --- | --- | --- |
+| OpenAI Subscription | yes | no (use Codex directly) |
+| OpenAI API | yes | no (use Codex directly) |
+| OpenRouter API | yes | yes |
+| Anthropic API | no (use Claude directly) | yes |
+| Codex CLI provider bridge | yes | no (recursive) |
+| OpenCode CLI provider bridge | yes | yes |
 
-For the official OpenAI API, `/v1/models` remains the authority for
-availability. macaz uses public models.dev metadata only to hide non-agentic
-entries and enrich capability labels. Startup falls back safely if models.dev
-is unavailable.
+API keys and OAuth credentials are stored in the operating-system credential
+store, not in `config.json`. The Anthropic option uses an Anthropic API key and
+the public Messages API; it does not use or convert a Claude consumer
+subscription. Anthropic model IDs, token limits, input capabilities, and effort
+levels are read from the account's live Models API during setup and startup.
 
-`macaz reset` removes macaz provider configuration, provider credentials, the
-isolated Claude profile, and macaz sessions. It does not delete normal Claude
-Code or vendor CLI credentials.
+Each start refreshes the active provider catalog. The resulting public model
+IDs and supported reasoning levels are written to the isolated client profile,
+so model selection works through Claude Code's or Codex CLI's native `/model`
+interface. The configured provider default is selected at launch; interactive
+changes follow the selected client's normal session behavior.
 
-## Isolation
+## Commands
 
-macaz uses a dedicated Claude profile and passes connection variables only to
-the child process it starts. Therefore:
+```text
+macaz claude [args...]    Start Claude Code
+macaz codex [args...]     Start Codex CLI
+macaz status [client]     Check the configured provider and model catalog
+macaz doctor [client]     Check the client executable and provider
+macaz reset [client]      Reset one client, or all macaz state when omitted
+macaz legal               Show the compatibility notice
+macaz update              Install the latest verified release
+macaz version             Show the installed version
+```
 
-- running `claude` normally does not use macaz;
-- macaz sessions do not remain in normal Claude history;
-- the macaz daemon is stopped when Claude exits;
-- Claude cannot silently retry or fall back to an official Anthropic model;
-- provider-native CLI context and tools are disabled or replaced.
+Arguments after `macaz claude` or `macaz codex` are forwarded to that client,
+except model/provider/profile overrides that would bypass macaz's authenticated
+local routing layer.
 
-The large welcome header collapsing to a smaller header after the first prompt
-is normal Claude Code UI behavior. The model shown in either header must remain
-the selected macaz provider model.
+Examples:
 
-## Provider Notes
+```sh
+macaz claude --dangerously-skip-permissions
+macaz codex --sandbox workspace-write
+macaz status codex
+macaz doctor claude
+macaz reset codex
+```
 
-- OpenAI API and OpenRouter use Responses-compatible HTTP APIs.
-- OpenAI Subscription uses device OAuth, refreshes credentials automatically,
-  serializes requests, and applies bounded retry/backoff for account rate
-  limits. Images remain native inputs; PDF and text documents are extracted
-  locally with strict size bounds because the account Codex endpoint does not
-  publish the public API's generic `input_file` contract. It is experimental
-  and remains subject to the provider's terms.
-- Codex-CLI uses `codex app-server`, client-supplied instructions, and dynamic
-  tools. It is the strongest local CLI bridge.
-- OpenCode-CLI uses an isolated request-scoped plugin/configuration because
-  OpenCode has no equivalent stable dynamic-tool protocol. It remains
-  experimental. Its native provider-auth plugins remain available so existing
-  OpenCode logins work, while project context, provider prompts, skills, MCP
-  configuration, and built-in tools remain excluded from model requests.
-- OpenCode model labels include their upstream provider. For example,
-  `OpenAI / GPT-5.4` uses the OpenAI account configured in OpenCode, while
-  `OpenCode Zen / GPT-5.4` uses OpenCode Zen and may require separate billing.
+`macaz reset claude` or `macaz reset codex` removes only that client's macaz
+configuration and isolated profile. It preserves the other client and shared
+provider credentials. `macaz reset` with no client removes both macaz profiles,
+all macaz-managed credentials, configuration, and isolated session history. It
+does not remove normal vendor-client profiles or credentials managed directly
+by vendor CLIs.
 
-No adapter can make different proprietary models semantically identical.
-macaz's compatibility target is preserving Claude Code's local client
-functionality and translating provider interactions without hidden fallback.
+## Isolation and security
 
-## Local Development
+- The local routing layer listens on a random `127.0.0.1` port.
+- A new random authentication token is generated for every launch.
+- The token exists only in the child process environment.
+- Config and profile files use private permissions where supported.
+- Normal Claude and Codex profiles are not modified.
+- The local routing process stops when the launched client exits.
+- There is no fallback to a different provider or official model.
+- macaz contains no project-operated analytics or telemetry client.
+
+The isolated profiles may contain client-owned session history. See
+[PRIVACY.md](PRIVACY.md) for exact data flow and deletion behavior.
+
+## Provider notes
+
+- OpenAI API and OpenRouter use Responses-compatible HTTP adapters.
+- OpenAI Subscription uses device authorization, refreshes credentials, and
+  applies bounded account retry/backoff. It is experimental and remains
+  subject to OpenAI's current account terms.
+- Anthropic API uses native `/v1/models`, `/v1/messages`, and
+  `/v1/messages/count_tokens`. Responses custom tools are converted to normal
+  Anthropic tools with a typed raw-input wrapper and converted back before
+  Codex executes them.
+- Codex CLI as a provider uses `codex app-server` and is offered only to the
+  Claude client; using Codex as both client and upstream would recurse.
+- OpenCode CLI uses an isolated request-scoped provider configuration. Its
+  project tools and context are not exposed as a second agent layer.
+
+## Local development
 
 Go 1.26.5 or newer is required.
 
-Run directly from source (the reported version is `dev`):
+Run from source:
 
 ```sh
 go run ./cmd/macaz version
-go run ./cmd/macaz
+go run ./cmd/macaz claude
+go run ./cmd/macaz codex
 ```
 
-Development builds do not perform update checks and cannot self-update. The
-feature is enabled only when the build contains a release version such as
-`v1.0.0`.
-
-Build and run a local binary. The root-level output is ignored by Git:
+Build and run a local binary:
 
 ```sh
 go build -o ./macaz ./cmd/macaz
 ./macaz version
-./macaz
+./macaz codex
 ```
 
-Run the local verification suite:
+Run verification:
 
 ```sh
 go mod verify
@@ -201,70 +230,37 @@ go vet ./...
 go test -race ./...
 ```
 
-Build the complete local release package with an explicit version:
+Build a complete local release package into ignored `dist/`:
 
 ```sh
 ./scripts/build-release.sh v1.0.0
 ```
 
-The release script creates all six static binaries under ignored `dist/`:
-macOS, Linux, and Windows for both amd64 and arm64. Every binary has the same
-unrestricted functionality. The output directory must be empty, so stale
-artifacts cannot enter a release. Use `OUTPUT_DIR` for another empty location:
+The release script requires an empty output directory and creates static
+macOS, Linux, and Windows binaries for amd64 and arm64, plus checksums and the
+installer. To choose another empty directory:
 
 ```sh
 OUTPUT_DIR=/tmp/macaz-release ./scripts/build-release.sh v1.0.0
 ```
 
-GitHub Releases use this same script.
+Opt-in live-provider tests never run in normal CI:
 
-The release package also contains the canonical `scripts/install.sh`. It
-installs either the latest GitHub release or a version selected with
-`--version`:
-
-```text
-curl -fsSL https://raw.githubusercontent.com/macaz-dev/macaz-cli/main/scripts/install.sh | sh
-```
-
-Real providers use explicit opt-in smoke tests, so normal CI never consumes
-credentials or provider quota. The API-provider tests validate text, forced
-client tool calls, images when the selected model advertises vision, and
-documents when the provider path supports them:
-
-```text
+```sh
 MACAZ_OPENAI_API_INTEGRATION_MODEL=<model> go test ./internal/provider/openai -run LiveOpenAIAPI
 MACAZ_OPENAI_SUBSCRIPTION_INTEGRATION_MODEL=<model> go test ./internal/provider/openai -run LiveOpenAISubscription
 MACAZ_OPENROUTER_INTEGRATION_MODEL=<provider/model> go test ./internal/provider/openrouter -run LiveOpenRouter
-MACAZ_CODEX_INTEGRATION_EXECUTABLE=<codex-or-wcodex> go test ./internal/provider/codexcli -run LiveCodex
+MACAZ_CODEX_INTEGRATION_EXECUTABLE=<codex-or-compatible> go test ./internal/provider/codexcli -run LiveCodex
 MACAZ_OPENCODE_INTEGRATION_MODEL=<provider/model> go test ./internal/provider/opencodecli -run LiveOpenCode
 MACAZ_CLAUDE_INTEGRATION=1 go test ./internal/app -run LiveClaudeLifecycle
 ```
 
-Release builds are static (`CGO_ENABLED=0`) and target:
-
-- Linux `amd64`, `arm64`
-- macOS `amd64`, `arm64`
-- Windows `amd64`, `arm64`
-
-Every PR merged into `main` runs release verification, reserves the next
-SemVer tag, builds all six binaries, generates checksums and provenance, and
-publishes a GitHub Release with generated release notes. The default bump is
-`patch`; add a `release:minor` or `release:major` PR label for that bump. The
-first default release is `v0.1.0`. A rerun reuses the tag already attached to
-the merge commit instead of creating another release version.
-
-## Security
-
-- Random `127.0.0.1` port and random token per launch.
-- Secrets in the OS credential store.
-- Private config/profile files.
-- Bounded request, response, and attachment sizes.
-- Context cancellation and timeouts.
-- No macaz prompt or response persistence.
-- Claude Code telemetry, error reporting, feedback, and surveys disabled in the
-  macaz child process.
+Every merged pull request on `main` is verified, assigned the next SemVer tag,
+built for all supported platforms, and published as a GitHub Release with
+checksums, provenance, and generated release notes. The default bump is patch;
+the `release:minor` and `release:major` labels select larger bumps.
 
 ## License
 
-macaz is licensed under the [Apache License 2.0](LICENSE).
-Third-party attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Apache License 2.0. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

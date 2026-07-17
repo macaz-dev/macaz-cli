@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -21,6 +23,39 @@ func (fakeProvider) Name() string                { return "fake" }
 func (fakeProvider) Check(context.Context) error { return nil }
 func (fakeProvider) Models(context.Context) ([]provider.Model, error) {
 	return []provider.Model{{ID: "fake-model", Default: true, Efforts: []string{"high"}}}, nil
+}
+
+type capturingProvider struct {
+	fakeProvider
+	request *protocol.Request
+}
+
+type toolCallProvider struct{ fakeProvider }
+
+type collidingModelProvider struct{ fakeProvider }
+
+func (collidingModelProvider) Models(context.Context) ([]provider.Model, error) {
+	return []provider.Model{{ID: "vendor/model", Default: true}, {ID: "vendor-model"}}, nil
+}
+
+func (toolCallProvider) Generate(_ context.Context, req *protocol.Request, emit protocol.EmitFunc) (protocol.Result, error) {
+	if len(req.Tools) == 0 {
+		return protocol.Result{}, errors.New("test request contained no tools")
+	}
+	tool := req.Tools[0]
+	block := protocol.Block{Type: "tool_use", ID: "call_namespaced", Name: tool.Name, Input: json.RawMessage(`{}`)}
+	if req.Stream {
+		_ = emit(protocol.Event{Kind: protocol.EventBlockStart, Index: 0, Block: block})
+		_ = emit(protocol.Event{Kind: protocol.EventBlockDelta, Index: 0, DeltaType: "input_json_delta", Delta: `{}`})
+		_ = emit(protocol.Event{Kind: protocol.EventBlockStop, Index: 0})
+	}
+	return protocol.Result{ID: "resp_tool", Model: req.Model, Blocks: []protocol.Block{block}, StopReason: "tool_use"}, nil
+}
+
+func (p *capturingProvider) Generate(ctx context.Context, req *protocol.Request, emit protocol.EmitFunc) (protocol.Result, error) {
+	copy := *req
+	p.request = &copy
+	return p.fakeProvider.Generate(ctx, req, emit)
 }
 func (fakeProvider) CountTokens(context.Context, *protocol.Request) (int, bool, error) {
 	return 42, false, nil
@@ -107,6 +142,124 @@ func TestStreamingOrder(t *testing.T) {
 	want := "message_start,content_block_start,content_block_delta,content_block_stop,message_delta,message_stop"
 	if got != want {
 		t.Fatalf("events = %s, want %s", got, want)
+	}
+}
+
+func TestCodexResponsesMapsRequestsAndStreamsResponsesEvents(t *testing.T) {
+	upstream := &capturingProvider{}
+	server, err := NewForClient(config.Default(), upstream, config.ClientCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close(context.Background())
+	catalog, err := server.PrimeModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.IDs) != 1 || catalog.Default != "fake-model" || strings.HasPrefix(catalog.Default, "claude-") {
+		t.Fatalf("Codex catalog = %#v", catalog)
+	}
+
+	body := `{
+		"model":` + strconv.Quote(catalog.Default) + `,
+		"instructions":"act as a coding agent",
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+		"tools":[{"type":"function","name":"Read","parameters":{"type":"object"}}],
+		"stream":false
+	}`
+	resp := doRequest(t, server, "/v1/responses", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["object"] != "response" || payload["model"] != catalog.Default || payload["output_text"] != "hello" {
+		t.Fatalf("response = %#v", payload)
+	}
+	if upstream.request == nil || upstream.request.Model != "fake-model" || len(upstream.request.Tools) != 1 || upstream.request.Tools[0].Name != "Read" {
+		t.Fatalf("mapped request = %#v", upstream.request)
+	}
+
+	body = strings.Replace(body, `"stream":false`, `"stream":true`, 1)
+	resp = doRequest(t, server, "/v1/responses", body)
+	defer resp.Body.Close()
+	var events []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		if line := scanner.Text(); strings.HasPrefix(line, "event: ") {
+			events = append(events, strings.TrimPrefix(line, "event: "))
+		}
+	}
+	got := strings.Join(events, ",")
+	want := "response.created,response.output_item.added,response.content_part.added,response.output_text.delta,response.output_text.done,response.content_part.done,response.output_item.done,response.completed"
+	if got != want {
+		t.Fatalf("events = %s, want %s", got, want)
+	}
+}
+
+func TestPublicModelIDsStayReadableAndResolveRareCollisions(t *testing.T) {
+	server, err := NewForClient(config.Default(), collidingModelProvider{}, config.ClientCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := server.PrimeModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"vendor-model", "vendor-model-2"}
+	if len(catalog.IDs) != len(want) || catalog.IDs[0] != want[0] || catalog.IDs[1] != want[1] {
+		t.Fatalf("public IDs = %#v, want %#v", catalog.IDs, want)
+	}
+	if catalog.UpstreamByID[want[0]] != "vendor/model" || catalog.UpstreamByID[want[1]] != "vendor-model" {
+		t.Fatalf("upstream mapping = %#v", catalog.UpstreamByID)
+	}
+}
+
+func TestCodexNamespaceToolRoundTripsThroughResponsesStream(t *testing.T) {
+	server, err := NewForClient(config.Default(), toolCallProvider{}, config.ClientCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close(context.Background())
+	catalog, err := server.PrimeModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{
+		"model":` + strconv.Quote(catalog.Default) + `,
+		"input":"list agents",
+		"tools":[{"type":"namespace","name":"collaboration","description":"Agent tools","tools":[
+			{"type":"function","name":"list_agents","description":"List agents","parameters":{"type":"object"}}
+		]}],
+		"stream":true
+	}`
+	resp := doRequest(t, server, "/v1/responses", body)
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := string(raw)
+	for _, required := range []string{
+		`"type":"function_call"`, `"call_id":"call_namespaced"`,
+		`"namespace":"collaboration"`, `"name":"list_agents"`,
+	} {
+		if !strings.Contains(stream, required) {
+			t.Fatalf("namespace stream is missing %s:\n%s", required, stream)
+		}
+	}
+	if strings.Contains(stream, `"name":"collaboration__list_agents"`) {
+		t.Fatalf("internal flattened tool name leaked to Codex:\n%s", stream)
 	}
 }
 
