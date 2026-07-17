@@ -25,9 +25,24 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/provider/opencodecli"
 	"github.com/macaz-dev/macaz-cli/internal/provider/openrouter"
 	"github.com/macaz-dev/macaz-cli/internal/secrets"
+	"github.com/macaz-dev/macaz-cli/internal/updater"
 )
 
 var Version = "dev"
+
+const (
+	updateCheckTimeout = 2 * time.Second
+	updateRunTimeout   = 2 * time.Minute
+)
+
+type updateClient interface {
+	Check(context.Context) (updater.Release, error)
+	Update(context.Context) (updater.Result, error)
+}
+
+var newUpdateClient = func(version string) updateClient {
+	return updater.New(version)
+}
 
 type Streams struct {
 	In  io.Reader
@@ -37,6 +52,10 @@ type Streams struct {
 
 func Run(ctx context.Context, args []string, streams Streams) error {
 	streams = withDefaultStreams(streams)
+	_ = updater.CleanupOldExecutable()
+	if shouldCheckForUpdate(args) {
+		notifyAvailableUpdate(ctx, streams.Err)
+	}
 	if len(args) == 0 {
 		return runClaude(ctx, nil, streams)
 	}
@@ -50,6 +69,8 @@ func Run(ctx context.Context, args []string, streams Streams) error {
 	case "legal":
 		legalNotice(streams.Out)
 		return nil
+	case "update":
+		return runUpdate(ctx, args[1:], streams)
 	case "version", "--version", "-v":
 		_, _ = fmt.Fprintf(streams.Out, "macaz %s (%s/%s)\n", Version, runtime.GOOS, runtime.GOARCH)
 		return nil
@@ -59,6 +80,48 @@ func Run(ctx context.Context, args []string, streams Streams) error {
 	default:
 		return runClaude(ctx, args, streams)
 	}
+}
+
+func shouldCheckForUpdate(args []string) bool {
+	if len(args) > 0 && args[0] == "update" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("MACAZ_NO_UPDATE_CHECK"))) {
+	case "1", "true", "yes":
+		return false
+	default:
+		return true
+	}
+}
+
+func notifyAvailableUpdate(ctx context.Context, out io.Writer) {
+	checkCtx, cancel := context.WithTimeout(ctx, updateCheckTimeout)
+	defer cancel()
+	release, err := newUpdateClient(Version).Check(checkCtx)
+	if err != nil || !release.Available {
+		return
+	}
+	_, _ = fmt.Fprintf(out, "macaz: update available: %s (current %s). Run: macaz update\n", release.Latest, release.Current)
+}
+
+func runUpdate(ctx context.Context, args []string, streams Streams) error {
+	if len(args) != 0 {
+		return errors.New("usage: macaz update")
+	}
+	_, _ = fmt.Fprintln(streams.Out, "Checking for macaz updates…")
+	updateCtx, cancel := context.WithTimeout(ctx, updateRunTimeout)
+	defer cancel()
+	result, err := newUpdateClient(Version).Update(updateCtx)
+	if err != nil {
+		return err
+	}
+	if !result.Updated {
+		_, _ = fmt.Fprintf(streams.Out, "macaz %s is already up to date.\n", result.Current)
+		return nil
+	}
+	_, _ = fmt.Fprintf(streams.Out, "macaz updated: %s → %s\n", result.Current, result.Latest)
+	_, _ = fmt.Fprintf(streams.Out, "Binary: %s\n", result.Path)
+	return nil
 }
 
 func runReset(streams Streams) error {
@@ -411,6 +474,7 @@ Usage:
   macaz doctor
   macaz reset
   macaz legal
+  macaz update
   macaz version
 
 `+"`macaz` starts Claude Code directly, keeps its normal permission prompts, and routes only model inference through the selected provider.\n"+

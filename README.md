@@ -88,13 +88,38 @@ macaz status
 macaz doctor
 macaz reset
 macaz legal
+macaz update
 macaz version
 ```
 
-Every `macaz` start refreshes the provider catalog automatically, so newly
-available models appear in Claude's `/model` interface. Provider, model, and
-effort selection stay in the initial setup and Claude interface rather than
-adding duplicate macaz commands.
+Release builds perform a short, best-effort check against the official GitHub
+Releases page on each start. If a newer stable release exists, macaz prints a
+notice to standard error but never installs it automatically. Network failures
+remain silent and do not prevent the requested command from running. Disable
+this check with:
+
+```sh
+export MACAZ_NO_UPDATE_CHECK=1
+```
+
+Install the latest release in place with:
+
+```text
+macaz update
+```
+
+The updater downloads only the exact GitHub asset for the current operating
+system and architecture, requires its entry in `SHA256SUMS`, checks GitHub's
+asset digest when available, executes the staged binary to confirm its embedded
+version, and then replaces the current executable with rollback protection. It
+does not send configuration, credentials, prompts, or provider data. The user
+running macaz must have write permission to the installed binary's directory;
+otherwise, use the installer with suitable permissions.
+
+Every provider-backed `macaz` start refreshes the provider catalog
+automatically, so newly available models appear in Claude's `/model` interface.
+Provider, model, and effort selection stay in the initial setup and Claude
+interface rather than adding duplicate macaz commands.
 
 For the official OpenAI API, `/v1/models` remains the authority for
 availability. macaz uses public models.dev metadata only to hide non-agentic
@@ -154,6 +179,10 @@ Run directly from source (the reported version is `dev`):
 go run ./cmd/macaz version
 go run ./cmd/macaz
 ```
+
+Development builds do not perform update checks and cannot self-update. The
+feature is enabled only when the build contains a release version such as
+`v1.0.0`.
 
 Build and run a local binary. The root-level output is ignored by Git:
 
