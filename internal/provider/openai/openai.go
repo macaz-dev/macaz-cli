@@ -33,15 +33,21 @@ const (
 )
 
 type Provider struct {
-	mode             Mode
-	cfg              config.Config
-	httpClient       *http.Client
-	account          *accountAuth
-	subscriptionGate chan struct{}
-	retryBase        time.Duration
-	modelMu          sync.Mutex
-	models           []provider.Model
-	modelsAt         time.Time
+	mode              Mode
+	cfg               config.Config
+	httpClient        *http.Client
+	account           *accountAuth
+	subscriptionMu    sync.Mutex
+	subscriptionGates map[string]*generateGate
+	retryBase         time.Duration
+	modelMu           sync.Mutex
+	models            []provider.Model
+	modelsAt          time.Time
+}
+
+type generateGate struct {
+	token chan struct{}
+	refs  int
 }
 
 func New(mode Mode, cfg config.Config) (*Provider, error) {
@@ -55,10 +61,10 @@ func New(mode Mode, cfg config.Config) (*Provider, error) {
 	}
 	if mode == ModeSubscription {
 		p.account = newAccountAuth(client)
-		// Subscription account endpoints have substantially tighter burst
-		// limits than API projects. Claude Code can create many subagent
-		// requests at once, so serialize them at the local gateway boundary.
-		p.subscriptionGate = make(chan struct{}, 1)
+		// Keep turns ordered within one Claude session/agent while allowing
+		// independent agents to progress concurrently. Upstream rate limits,
+		// rather than an arbitrary local cap, govern cross-session fan-out.
+		p.subscriptionGates = make(map[string]*generateGate)
 	}
 	return p, nil
 }
@@ -442,7 +448,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	if err != nil {
 		return protocol.Result{}, err
 	}
-	release, err := p.acquireGenerate(ctx)
+	release, err := p.acquireGenerate(ctx, req)
 	if err != nil {
 		return protocol.Result{}, err
 	}
@@ -459,16 +465,40 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	return collector.Result(), nil
 }
 
-func (p *Provider) acquireGenerate(ctx context.Context) (func(), error) {
-	if p.subscriptionGate == nil {
+func (p *Provider) acquireGenerate(ctx context.Context, req *protocol.Request) (func(), error) {
+	if p.subscriptionGates == nil {
 		return func() {}, nil
 	}
+	key := "legacy"
+	if req != nil && strings.TrimSpace(req.PromptCacheKey) != "" {
+		key = strings.TrimSpace(req.PromptCacheKey)
+	}
+	p.subscriptionMu.Lock()
+	gate := p.subscriptionGates[key]
+	if gate == nil {
+		gate = &generateGate{token: make(chan struct{}, 1)}
+		p.subscriptionGates[key] = gate
+	}
+	gate.refs++
+	p.subscriptionMu.Unlock()
+	releaseGate := func(held bool) {
+		if held {
+			<-gate.token
+		}
+		p.subscriptionMu.Lock()
+		gate.refs--
+		if gate.refs == 0 {
+			delete(p.subscriptionGates, key)
+		}
+		p.subscriptionMu.Unlock()
+	}
 	select {
-	case p.subscriptionGate <- struct{}{}:
-		return func() { <-p.subscriptionGate }, nil
+	case gate.token <- struct{}{}:
 	case <-ctx.Done():
+		releaseGate(false)
 		return nil, ctx.Err()
 	}
+	return func() { releaseGate(true) }, nil
 }
 
 func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*http.Response, error) {

@@ -1,6 +1,7 @@
 package openresponses
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -21,6 +22,49 @@ func TestCollectorFailsClosedOnFailedResponse(t *testing.T) {
 	}`))
 	if err == nil || !strings.Contains(err.Error(), "upstream generation failed") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestCollectorPreservesEncryptedReasoningForStatelessReplay(t *testing.T) {
+	rawSignature := make([]byte, 73)
+	rawSignature[0] = 0x80
+	signature := base64.RawURLEncoding.EncodeToString(rawSignature)
+	var events []protocol.Event
+	collector := NewCollector("gpt-test", protocol.NewToolNames(nil), true, func(event protocol.Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if err := collector.Handle("response.output_item.added", []byte(`{
+		"type":"response.output_item.added",
+		"item":{"id":"rs_1","type":"reasoning","encrypted_content":"`+signature+`"}
+	}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := collector.Handle("response.output_item.done", []byte(`{
+		"type":"response.output_item.done",
+		"item":{"id":"rs_1","type":"reasoning","encrypted_content":"`+signature+`","summary":[{"type":"summary_text","text":"summary"}]}
+	}`)); err != nil {
+		t.Fatal(err)
+	}
+	result := collector.Result()
+	if len(result.Blocks) != 1 || result.Blocks[0].Signature != signature || result.Blocks[0].Thinking != "summary" {
+		t.Fatalf("blocks = %#v", result.Blocks)
+	}
+	if len(events) != 3 || events[2].Block.Signature != signature {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestCollectorIgnoresEmptyReasoningItem(t *testing.T) {
+	collector := NewCollector("gpt-test", protocol.NewToolNames(nil), false, nil)
+	if err := collector.Handle("response.output_item.done", []byte(`{
+		"type":"response.output_item.done",
+		"item":{"id":"rs_empty","type":"reasoning","summary":[]}
+	}`)); err != nil {
+		t.Fatal(err)
+	}
+	if blocks := collector.Result().Blocks; len(blocks) != 0 {
+		t.Fatalf("blocks = %#v", blocks)
 	}
 }
 

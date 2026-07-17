@@ -81,7 +81,16 @@ func (c *Collector) Handle(event string, data []byte) error {
 			}
 			c.arguments[index] = ""
 			c.stopReason = "tool_use"
-		case "message", "reasoning":
+		case "reasoning":
+			signature := stringValue(item["encrypted_content"])
+			if signature != "" {
+				_, err := c.start(itemID, protocol.Block{Type: "thinking", Signature: signature})
+				return err
+			}
+			if itemID != "" {
+				c.itemIndex[itemID] = -1
+			}
+		case "message":
 			if itemID != "" {
 				c.itemIndex[itemID] = -1
 			}
@@ -120,6 +129,28 @@ func (c *Collector) Handle(event string, data []byte) error {
 			itemID = stringValue(item["id"])
 		}
 		index, ok := c.index(itemID)
+		if !ok && item != nil && stringValue(item["type"]) == "reasoning" {
+			signature := stringValue(item["encrypted_content"])
+			summary := responseSummaryText(item["summary"])
+			if signature == "" && summary == "" {
+				return nil
+			}
+			var err error
+			index, err = c.start(itemID, protocol.Block{
+				Type:      "thinking",
+				Thinking:  summary,
+				Signature: first(signature, "macaz-openresponses-reasoning-summary"),
+			})
+			if err != nil {
+				return err
+			}
+			if summary != "" {
+				if err := c.delta(index, "thinking_delta", summary); err != nil {
+					return err
+				}
+			}
+			ok = true
+		}
 		if !ok {
 			return nil
 		}
@@ -137,6 +168,18 @@ func (c *Collector) Handle(event string, data []byte) error {
 				full = "{}"
 			}
 			c.blocks[index].Input = json.RawMessage(full)
+		} else if c.blocks[index].Type == "thinking" && item != nil {
+			if signature := stringValue(item["encrypted_content"]); signature != "" {
+				c.blocks[index].Signature = signature
+			}
+			if c.blocks[index].Thinking == "" {
+				if summary := responseSummaryText(item["summary"]); summary != "" {
+					c.blocks[index].Thinking = summary
+					if err := c.delta(index, "thinking_delta", summary); err != nil {
+						return err
+					}
+				}
+			}
 		}
 		return c.stop(index)
 	case "response.completed", "response.incomplete", "response.failed", "response.cancelled":
@@ -288,9 +331,22 @@ func (c *Collector) stop(index int) error {
 	}
 	delete(c.open, index)
 	if c.stream && c.emit != nil {
-		return c.emit(protocol.Event{Kind: protocol.EventBlockStop, Index: index})
+		return c.emit(protocol.Event{Kind: protocol.EventBlockStop, Index: index, Block: c.blocks[index]})
 	}
 	return nil
+}
+
+func responseSummaryText(value any) string {
+	items, _ := value.([]any)
+	var result strings.Builder
+	for _, raw := range items {
+		item := mapValue(raw)
+		if item == nil || (stringValue(item["type"]) != "" && stringValue(item["type"]) != "summary_text") {
+			continue
+		}
+		result.WriteString(stringValue(item["text"]))
+	}
+	return result.String()
 }
 
 func (c *Collector) closeOpen() error {

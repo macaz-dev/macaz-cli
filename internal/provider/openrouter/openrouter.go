@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,7 +63,7 @@ func (p *Provider) Check(ctx context.Context) error {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return providerError(resp.StatusCode, raw)
+		return providerError(resp.StatusCode, resp.Header, raw)
 	}
 	models, err := p.Models(ctx)
 	if err != nil {
@@ -100,7 +101,7 @@ func (p *Provider) Models(ctx context.Context) ([]provider.Model, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return nil, providerError(resp.StatusCode, raw)
+		return nil, providerError(resp.StatusCode, resp.Header, raw)
 	}
 	var payload struct {
 		Data []struct {
@@ -193,7 +194,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-		return protocol.Result{}, providerError(resp.StatusCode, body)
+		return protocol.Result{}, providerError(resp.StatusCode, resp.Header, body)
 	}
 	collector := openresponses.NewCollector(model, translated.ToolNames, req.Stream, emit)
 	if err := openresponses.ReadSSE(resp.Body, collector.Handle); err != nil {
@@ -219,7 +220,7 @@ func (p *Provider) authorize(req *http.Request) error {
 	return nil
 }
 
-func providerError(status int, raw []byte) error {
+func providerError(status int, header http.Header, raw []byte) error {
 	message := strings.TrimSpace(string(raw))
 	var payload struct {
 		Error struct {
@@ -231,11 +232,26 @@ func providerError(status int, raw []byte) error {
 		message = payload.Error.Message
 	}
 	return &provider.HTTPError{
-		Status:  status,
-		Type:    "provider_error",
-		Message: message,
-		Body:    raw,
+		Status:     status,
+		Type:       "provider_error",
+		Message:    message,
+		Body:       raw,
+		RetryAfter: openRouterRetryAfter(header),
 	}
+}
+
+func openRouterRetryAfter(header http.Header) time.Duration {
+	if milliseconds, err := strconv.ParseInt(strings.TrimSpace(header.Get("retry-after-ms")), 10, 64); err == nil && milliseconds > 0 {
+		return time.Duration(milliseconds) * time.Millisecond
+	}
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		return max(time.Until(when), 0)
+	}
+	return 0
 }
 
 func stringSet(values []string) map[string]bool {

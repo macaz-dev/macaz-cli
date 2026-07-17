@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -135,12 +136,15 @@ func (s *Server) Token() string {
 }
 
 func (s *Server) Close(ctx context.Context) error {
-	if s.listener == nil {
-		return nil
+	var shutdownErr error
+	if s.listener != nil {
+		shutdownErr = s.http.Shutdown(ctx)
+		s.wg.Wait()
 	}
-	err := s.http.Shutdown(ctx)
-	s.wg.Wait()
-	return err
+	if closer, ok := s.provider.(interface{ Close() error }); ok {
+		return errors.Join(shutdownErr, closer.Close())
+	}
+	return shutdownErr
 }
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -194,6 +198,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Model = upstreamModel
 	restrictRecursiveSubagentTools(req)
+	s.attachClientRouting(r, req)
 	if req.Stream {
 		s.streamMessages(w, r, req, requestedModel)
 		return
@@ -211,6 +216,47 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, messageResponse(result, requestedModel))
 }
 
+func (s *Server) attachClientRouting(r *http.Request, req *protocol.Request) {
+	if s.client != config.ClientClaude || r == nil || req == nil {
+		return
+	}
+	sessionID := strings.TrimSpace(r.Header.Get("X-Claude-Code-Session-Id"))
+	if sessionID == "" {
+		sessionID = claudeSessionFromMetadata(req.Metadata)
+	}
+	if sessionID == "" {
+		return
+	}
+	agentID := strings.TrimSpace(r.Header.Get("X-Claude-Code-Agent-Id"))
+	if agentID == "" {
+		agentID = "main"
+	}
+	identity := strings.Join([]string{"macaz", "claude", req.Model, sessionID, agentID}, "\x00")
+	hash := sha256.Sum256([]byte(identity))
+	req.PromptCacheKey = "macaz_" + hex.EncodeToString(hash[:16])
+}
+
+func claudeSessionFromMetadata(metadata map[string]any) string {
+	value := strings.TrimSpace(fmt.Sprint(metadata["user_id"]))
+	if value == "" || value == "<nil>" {
+		return ""
+	}
+	if strings.HasPrefix(value, "{") {
+		var payload struct {
+			SessionID string `json:"session_id"`
+		}
+		if json.Unmarshal([]byte(value), &payload) == nil {
+			return strings.TrimSpace(payload.SessionID)
+		}
+	}
+	const marker = "_session_"
+	index := strings.LastIndex(value, marker)
+	if index < 0 {
+		return ""
+	}
+	return strings.TrimSpace(value[index+len(marker):])
+}
+
 func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, req *protocol.Request, requestedModel string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -218,29 +264,35 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, req *pro
 		return
 	}
 	messageID := "msg_" + mustRandomToken(12)
-	model := requestedModel
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	writeSSE(w, "message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id":            messageID,
-			"type":          "message",
-			"role":          "assistant",
-			"content":       []any{},
-			"model":         model,
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"usage": protocol.Usage{
-				InputTokens:  0,
-				OutputTokens: 0,
+	streamStarted := false
+	startStream := func() {
+		if streamStarted {
+			return
+		}
+		streamStarted = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		writeSSE(w, "message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id":            messageID,
+				"type":          "message",
+				"role":          "assistant",
+				"content":       []any{},
+				"model":         requestedModel,
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage": protocol.Usage{
+					InputTokens:  0,
+					OutputTokens: 0,
+				},
 			},
-		},
-	})
-	flusher.Flush()
+		})
+		flusher.Flush()
+	}
 
 	started := map[int]protocol.Block{}
 	emit := func(event protocol.Event) error {
@@ -249,6 +301,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, req *pro
 			return r.Context().Err()
 		default:
 		}
+		startStream()
 		switch event.Kind {
 		case protocol.EventBlockStart:
 			started[event.Index] = event.Block
@@ -277,7 +330,11 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, req *pro
 				"delta": delta,
 			})
 		case protocol.EventBlockStop:
-			if block := started[event.Index]; block.Type == "thinking" && block.Signature != "" {
+			block := event.Block
+			if block.Type == "" {
+				block = started[event.Index]
+			}
+			if block.Type == "thinking" && block.Signature != "" {
 				writeSSE(w, "content_block_delta", map[string]any{
 					"type":  "content_block_delta",
 					"index": event.Index,
@@ -300,10 +357,15 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, req *pro
 	result, err := s.provider.Generate(r.Context(), req, emit)
 	if err != nil {
 		s.recordFailure(err)
-		writeSSE(w, "error", anthropicError("api_error", err.Error()))
-		flusher.Flush()
+		if !streamStarted {
+			writeProviderError(w, err)
+		} else {
+			writeSSE(w, "error", anthropicError(providerErrorType(err), err.Error()))
+			flusher.Flush()
+		}
 		return
 	}
+	startStream()
 	if requestedModel != req.Model {
 		result.Model = requestedModel
 	}
@@ -652,20 +714,28 @@ func streamStartBlock(block protocol.Block) map[string]any {
 
 func writeProviderError(w http.ResponseWriter, err error) {
 	status := provider.Status(err)
-	errorType := "api_error"
-	if status == http.StatusBadRequest {
-		errorType = "invalid_request_error"
-	} else if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		errorType = "authentication_error"
-	} else if status == http.StatusTooManyRequests {
-		errorType = "rate_limit_error"
-	}
+	errorType := providerErrorType(err)
 	var httpErr *provider.HTTPError
 	if errors.As(err, &httpErr) && httpErr.RetryAfter > 0 {
 		seconds := int64((httpErr.RetryAfter + time.Second - 1) / time.Second)
 		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 	}
 	writeError(w, status, errorType, err.Error())
+}
+
+func providerErrorType(err error) string {
+	switch status := provider.Status(err); {
+	case status == http.StatusBadRequest:
+		return "invalid_request_error"
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "authentication_error"
+	case status == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
+		return "timeout_error"
+	default:
+		return "api_error"
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, errorType, message string) {

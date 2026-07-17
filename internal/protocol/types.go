@@ -23,6 +23,12 @@ type Request struct {
 	OutputFormat      json.RawMessage `json:"output_format,omitempty"`
 	ContextManagement json.RawMessage `json:"context_management,omitempty"`
 	Metadata          map[string]any  `json:"metadata,omitempty"`
+	ServiceTier       string          `json:"service_tier,omitempty"`
+	Speed             string          `json:"speed,omitempty"`
+	// PromptCacheKey is derived by the local gateway from a trusted client
+	// session header. It is provider routing metadata, not part of the
+	// Anthropic Messages wire payload accepted from the client.
+	PromptCacheKey string `json:"-"`
 }
 
 type Message struct {
@@ -215,5 +221,22 @@ func Effort(req *Request, fallback string) string {
 		return effort
 	default:
 		return "high"
+	}
+}
+
+func ServiceTier(req *Request) string {
+	if req == nil {
+		return ""
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Speed), "fast") {
+		return "priority"
+	}
+	switch value := strings.ToLower(strings.TrimSpace(req.ServiceTier)); value {
+	case "fast":
+		return "priority"
+	case "auto", "default", "flex", "priority":
+		return value
+	default:
+		return ""
 	}
 }

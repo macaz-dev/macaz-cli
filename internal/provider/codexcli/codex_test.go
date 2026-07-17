@@ -24,6 +24,7 @@ import (
 )
 
 type fakeCodexReport struct {
+	PID          int            `json:"pid"`
 	Args         []string       `json:"args"`
 	CWD          string         `json:"cwd"`
 	PWD          string         `json:"pwd"`
@@ -36,6 +37,12 @@ func TestMain(m *testing.M) {
 		os.Exit(runFakeCodex())
 	}
 	os.Exit(m.Run())
+}
+
+func TestProviderNameMarksCLIExperimental(t *testing.T) {
+	if got := New(config.Default()).Name(); got != "Codex-CLI (experimental)" {
+		t.Fatalf("provider name = %q", got)
+	}
 }
 
 func runFakeCodex() int {
@@ -53,6 +60,7 @@ func runFakeCodex() int {
 	encoder := json.NewEncoder(os.Stdout)
 	cwd, _ := os.Getwd()
 	report := fakeCodexReport{
+		PID:  os.Getpid(),
 		Args: append([]string(nil), os.Args[1:]...),
 		CWD:  cwd,
 		PWD:  os.Getenv("PWD"),
@@ -149,6 +157,19 @@ func runFakeCodex() int {
 				},
 			})
 		case "turn/interrupt":
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request.ID,
+				"result":  map[string]any{},
+			})
+			// Simulate the late completion that app-server can emit after the
+			// interrupted tool turn. A reused connection must drain this event.
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "turn/completed",
+				"params":  map[string]any{"turn": map[string]any{"id": "turn-fake", "status": "interrupted"}},
+			})
+		case "thread/unsubscribe":
 			_ = encoder.Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"id":      request.ID,
@@ -414,6 +435,56 @@ func TestProviderUsesClientContextDynamicToolsAndFullPermissions(t *testing.T) {
 	} {
 		if !strings.Contains(joinedArgs, expected) {
 			t.Fatalf("app-server args missing %q: %#v", expected, report.Args)
+		}
+	}
+}
+
+func TestProviderReusesQuiescedServerAfterInterruptedToolTurn(t *testing.T) {
+	reportPath := filepath.Join(t.TempDir(), "report.json")
+	t.Setenv("MACAZ_FAKE_CODEX", "1")
+	t.Setenv("MACAZ_FAKE_CODEX_REPORT", reportPath)
+
+	cfg := config.Default()
+	cfg.Provider = config.ProviderCodexCLI
+	cfg.CodexExecutable = os.Args[0]
+	upstream := New(cfg)
+	defer upstream.Close()
+
+	req := &protocol.Request{
+		Model: "fake-default",
+		Messages: []protocol.Message{{
+			Role:    "user",
+			Content: json.RawMessage(`"read README.md"`),
+		}},
+		Tools: []protocol.Tool{{
+			Name:        "Read",
+			Description: "Read a file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		ToolChoice: json.RawMessage(`{"type":"tool","name":"Read","disable_parallel_tool_use":true}`),
+	}
+
+	firstPID := 0
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := upstream.Generate(context.Background(), req, nil)
+		if err != nil {
+			t.Fatalf("generate %d: %v", attempt+1, err)
+		}
+		if result.StopReason != "tool_use" {
+			t.Fatalf("generate %d result = %#v", attempt+1, result)
+		}
+		raw, err := os.ReadFile(reportPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var report fakeCodexReport
+		if err := json.Unmarshal(raw, &report); err != nil {
+			t.Fatal(err)
+		}
+		if attempt == 0 {
+			firstPID = report.PID
+		} else if report.PID != firstPID {
+			t.Fatalf("app-server was not reused: first pid %d, second pid %d", firstPID, report.PID)
 		}
 	}
 }

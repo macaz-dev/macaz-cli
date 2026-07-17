@@ -393,14 +393,14 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 			{label: "OpenAI Subscription", provider: config.ProviderOpenAISubscription},
 			{label: "OpenAI API", provider: config.ProviderOpenAIAPIKey},
 			{label: "OpenRouter API", provider: config.ProviderOpenRouterAPI},
-			{label: "Codex-CLI", provider: config.ProviderCodexCLI},
-			{label: "OpenCode-CLI", provider: config.ProviderOpenCodeCLI},
+			{label: "Codex-CLI (experimental)", provider: config.ProviderCodexCLI},
+			{label: "OpenCode-CLI (experimental)", provider: config.ProviderOpenCodeCLI},
 		}
 	} else {
 		options = []providerOption{
 			{label: "OpenRouter API", provider: config.ProviderOpenRouterAPI},
 			{label: "Anthropic API", provider: config.ProviderAnthropicAPI},
-			{label: "OpenCode-CLI", provider: config.ProviderOpenCodeCLI},
+			{label: "OpenCode-CLI (experimental)", provider: config.ProviderOpenCodeCLI},
 		}
 	}
 	for index, option := range options {

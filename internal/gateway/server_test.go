@@ -34,6 +34,22 @@ type toolCallProvider struct{ fakeProvider }
 
 type collidingModelProvider struct{ fakeProvider }
 
+type failingStreamProvider struct {
+	fakeProvider
+	emitBeforeError bool
+}
+
+func (p failingStreamProvider) Generate(_ context.Context, _ *protocol.Request, emit protocol.EmitFunc) (protocol.Result, error) {
+	if p.emitBeforeError {
+		_ = emit(protocol.Event{Kind: protocol.EventBlockStart, Index: 0, Block: protocol.Block{Type: "text"}})
+	}
+	return protocol.Result{}, &provider.HTTPError{
+		Status:  http.StatusTooManyRequests,
+		Type:    "rate_limit_error",
+		Message: "slow down",
+	}
+}
+
 func (collidingModelProvider) Models(context.Context) ([]provider.Model, error) {
 	return []provider.Model{{ID: "vendor/model", Default: true}, {ID: "vendor-model"}}, nil
 }
@@ -115,6 +131,29 @@ func TestMessagesAndCountTokens(t *testing.T) {
 	}
 }
 
+func TestClaudeSessionRoutingIsStableAndAgentIsolated(t *testing.T) {
+	server := &Server{client: config.ClientClaude}
+	request := func(agent string) *protocol.Request {
+		httpReq, err := http.NewRequest(http.MethodPost, "http://127.0.0.1/v1/messages", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		httpReq.Header.Set("X-Claude-Code-Session-Id", "session-123")
+		if agent != "" {
+			httpReq.Header.Set("X-Claude-Code-Agent-Id", agent)
+		}
+		req := &protocol.Request{Model: "gpt-test"}
+		server.attachClientRouting(httpReq, req)
+		return req
+	}
+	mainA := request("").PromptCacheKey
+	mainB := request("main").PromptCacheKey
+	child := request("agent-1").PromptCacheKey
+	if mainA == "" || mainA != mainB || child == mainA {
+		t.Fatalf("cache keys: mainA=%q mainB=%q child=%q", mainA, mainB, child)
+	}
+}
+
 func TestStreamingOrder(t *testing.T) {
 	server, err := New(config.Default(), fakeProvider{})
 	if err != nil {
@@ -142,6 +181,67 @@ func TestStreamingOrder(t *testing.T) {
 	want := "message_start,content_block_start,content_block_delta,content_block_stop,message_delta,message_stop"
 	if got != want {
 		t.Fatalf("events = %s, want %s", got, want)
+	}
+}
+
+func TestStreamingPreservesHTTPProviderErrorBeforeFirstEvent(t *testing.T) {
+	server, err := New(config.Default(), failingStreamProvider{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close(context.Background())
+	if _, err := server.PrimeModels(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	request := `{"model":"fake-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	resp := doRequest(t, server, "/v1/messages", request)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, body = %s", resp.StatusCode, body)
+	}
+	if contentType := resp.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+		t.Fatalf("content type = %q", contentType)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	errorBody, _ := body["error"].(map[string]any)
+	if errorBody["type"] != "rate_limit_error" {
+		t.Fatalf("body = %#v", body)
+	}
+}
+
+func TestStreamingMapsProviderErrorAfterFirstEvent(t *testing.T) {
+	server, err := New(config.Default(), failingStreamProvider{emitBeforeError: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close(context.Background())
+	if _, err := server.PrimeModels(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	request := `{"model":"fake-model","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	resp := doRequest(t, server, "/v1/messages", request)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"type":"rate_limit_error"`)) {
+		t.Fatalf("stream = %s", body)
 	}
 }
 

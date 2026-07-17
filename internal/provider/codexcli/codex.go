@@ -28,14 +28,23 @@ type Provider struct {
 	modelMu  sync.Mutex
 	models   []provider.Model
 	modelsAt time.Time
+	poolMu   sync.Mutex
+	slots    chan struct{}
+	idle     chan *appServer
+	servers  map[*appServer]struct{}
+	closed   bool
 }
 
 func New(cfg config.Config) *Provider {
-	return &Provider{cfg: cfg}
+	limit := cfg.MaxConcurrentCLI
+	if limit < 1 {
+		limit = 1
+	}
+	return &Provider{cfg: cfg, slots: make(chan struct{}, limit), idle: make(chan *appServer, limit), servers: make(map[*appServer]struct{})}
 }
 
 func (p *Provider) Name() string {
-	return "Codex-CLI"
+	return "Codex-CLI (experimental)"
 }
 
 func (p *Provider) Check(ctx context.Context) error {
@@ -173,10 +182,6 @@ func (p *Provider) discoverModels(ctx context.Context) ([]provider.Model, error)
 }
 
 func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit protocol.EmitFunc) (protocol.Result, error) {
-	exe, err := exec.LookPath(p.cfg.CodexExecutable)
-	if err != nil {
-		return protocol.Result{}, fmt.Errorf("find Codex executable %q: %w", p.cfg.CodexExecutable, err)
-	}
 	selectedModel, err := p.selectModel(ctx, req.Model)
 	if err != nil {
 		return protocol.Result{}, err
@@ -225,65 +230,34 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		return protocol.Result{}, err
 	}
 	allowedImageViews := codexImagePaths(input, requestDir)
-
-	processCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	cmd := exec.CommandContext(processCtx, exe, appServerArgs()...)
-	cmd.Dir = requestDir
-	cmd.Env = codexEnvironment(requestDir)
-	stdin, err := cmd.StdinPipe()
+	server, release, err := p.acquireServer(ctx)
 	if err != nil {
 		return protocol.Result{}, err
 	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return protocol.Result{}, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return protocol.Result{}, err
-	}
-	if err := cmd.Start(); err != nil {
-		return protocol.Result{}, fmt.Errorf("start Codex app-server: %w", err)
-	}
-	var stderrBuffer boundedBuffer
-	stderrDone := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(&stderrBuffer, stderr)
-		close(stderrDone)
-	}()
-
-	rpc := newRPC(stdin, stdout)
-	defer func() {
-		cancel()
-		_ = stdin.Close()
-		_ = cmd.Wait()
-		<-stderrDone
-	}()
-
-	if _, err := rpc.request(ctx, 1, "initialize", initializeParams()); err != nil {
-		return protocol.Result{}, withStderr(err, stderrBuffer.String())
-	}
-	if err := rpc.notify("initialized", map[string]any{}); err != nil {
-		return protocol.Result{}, err
-	}
+	healthy := false
+	defer func() { release(healthy) }()
+	rpc := server.rpc
 
 	threadParams := threadStartParams(selectedModel, requestDir, system, dynamicTools)
-	threadResponse, err := rpc.request(ctx, 2, "thread/start", threadParams)
+	threadResponse, err := server.request(ctx, "thread/start", threadParams)
 	if err != nil {
-		return protocol.Result{}, withStderr(err, stderrBuffer.String())
+		return protocol.Result{}, withStderr(err, server.stderr.String())
 	}
 	threadID := nestedString(threadResponse, "thread", "id")
 	if threadID == "" {
 		return protocol.Result{}, fmt.Errorf("Codex thread/start returned no thread id")
 	}
-	turnResponse, err := rpc.request(ctx, 3, "turn/start", map[string]any{
+	turnParams := map[string]any{
 		"threadId": threadID,
 		"effort":   protocol.Effort(req, p.cfg.DefaultEffort),
 		"input":    input,
-	})
+	}
+	if tier := protocol.ServiceTier(req); tier != "" {
+		turnParams["serviceTier"] = tier
+	}
+	turnResponse, err := server.request(ctx, "turn/start", turnParams)
 	if err != nil {
-		return protocol.Result{}, withStderr(err, stderrBuffer.String())
+		return protocol.Result{}, withStderr(err, server.stderr.String())
 	}
 	turnID := nestedString(turnResponse, "turn", "id")
 	if turnID == "" {
@@ -310,23 +284,23 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		case <-ctx.Done():
 			return protocol.Result{}, ctx.Err()
 		case <-toolTimer:
-			_ = rpc.sendRequest(1000, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID})
 			for i := range result.Blocks {
 				if req.Stream && emit != nil {
 					_ = emit(protocol.Event{Kind: protocol.EventBlockStop, Index: i})
 				}
 			}
 			result.StopReason = "tool_use"
+			healthy = server.interruptAndQuiesce(ctx, threadID, turnID)
 			return result, nil
 		case envelope, ok := <-rpc.events:
 			if !ok {
 				if len(result.Blocks) > 0 {
 					return result, nil
 				}
-				return protocol.Result{}, withStderr(errors.New("Codex app-server closed its output"), stderrBuffer.String())
+				return protocol.Result{}, withStderr(errors.New("Codex app-server closed its output"), server.stderr.String())
 			}
 			if envelope.Error != nil {
-				return protocol.Result{}, withStderr(envelope.Error, stderrBuffer.String())
+				return protocol.Result{}, withStderr(envelope.Error, server.stderr.String())
 			}
 			switch envelope.Method {
 			case "item/agentMessage/delta":
@@ -377,11 +351,11 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 					}
 				}
 				if toolPolicy.DisableParallel {
-					_ = rpc.sendRequest(1000, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": turnID})
 					if req.Stream && emit != nil {
 						_ = emit(protocol.Event{Kind: protocol.EventBlockStop, Index: index})
 					}
 					result.StopReason = "tool_use"
+					healthy = server.interruptAndQuiesce(ctx, threadID, turnID)
 					return result, nil
 				}
 				if timer == nil {
@@ -446,6 +420,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 				if len(result.Blocks) == 0 {
 					return protocol.Result{}, errors.New("Codex returned no text or client tool call")
 				}
+				healthy = server.quiesceThread(ctx, threadID)
 				return result, nil
 			case "error":
 				return protocol.Result{}, fmt.Errorf("Codex app-server error: %v", envelope.Params)

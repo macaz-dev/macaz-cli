@@ -39,6 +39,12 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestProviderNameMarksCLIExperimental(t *testing.T) {
+	if got := New(config.Default()).Name(); got != "OpenCode-CLI (experimental)" {
+		t.Fatalf("provider name = %q", got)
+	}
+}
+
 func runFakeOpenCode() int {
 	if len(os.Args) < 2 {
 		return 2

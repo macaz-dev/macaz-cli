@@ -123,8 +123,8 @@ Available upstreams:
 | OpenAI API | yes | no (use Codex directly) |
 | OpenRouter API | yes | yes |
 | Anthropic API | no (use Claude directly) | yes |
-| Codex CLI provider bridge | yes | no (recursive) |
-| OpenCode CLI provider bridge | yes | yes |
+| Codex CLI provider bridge (experimental) | yes | no (recursive) |
+| OpenCode CLI provider bridge (experimental) | yes | yes |
 
 API keys and OAuth credentials are stored in the operating-system credential
 store, not in `config.json`. The Anthropic option uses an Anthropic API key and
@@ -200,6 +200,10 @@ The isolated profiles may contain client-owned session history. See
   Claude client; using Codex as both client and upstream would recurse.
 - OpenCode CLI uses an isolated request-scoped provider configuration. Its
   project tools and context are not exposed as a second agent layer.
+- Claude Code controls skill and subagent fan-out. Parallel subagents and Auto
+  mode classifier checks can consume substantially more provider usage than a
+  single-agent Codex session; macaz preserves that client behavior and does not
+  impose a non-standard cross-session limit.
 
 ## Local development
 
