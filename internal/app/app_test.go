@@ -202,12 +202,12 @@ func TestWizardOnlyOffersUsefulProvidersForEachClient(t *testing.T) {
 	}{
 		{
 			client:  config.ClientClaude,
-			present: []string{"OpenAI Subscription", "OpenAI API", "OpenRouter API", "Codex-CLI", "OpenCode-CLI"},
+			present: []string{"OpenAI Subscription", "OpenAI API", "OpenRouter API", "Codex-CLI (experimental)", "OpenCode-CLI (experimental)"},
 			absent:  []string{"Anthropic API"},
 		},
 		{
 			client:  config.ClientCodex,
-			present: []string{"OpenRouter API", "Anthropic API", "OpenCode-CLI"},
+			present: []string{"OpenRouter API", "Anthropic API", "OpenCode-CLI (experimental)"},
 			absent:  []string{"OpenAI Subscription", "OpenAI API", "Codex-CLI"},
 		},
 	}

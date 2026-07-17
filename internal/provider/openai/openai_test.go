@@ -469,6 +469,48 @@ func TestSubscriptionRetriesRateLimitsAndSerializesConcurrentRequests(t *testing
 	}
 }
 
+func TestSubscriptionGateIsScopedToPromptCacheKey(t *testing.T) {
+	upstream, err := New(ModeSubscription, config.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseFirst, err := upstream.acquireGenerate(context.Background(), &protocol.Request{PromptCacheKey: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sameKey := make(chan error, 1)
+	go func() {
+		release, acquireErr := upstream.acquireGenerate(context.Background(), &protocol.Request{PromptCacheKey: "session-a"})
+		if acquireErr == nil {
+			release()
+		}
+		sameKey <- acquireErr
+	}()
+	select {
+	case err := <-sameKey:
+		t.Fatalf("same session was not serialized: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	differentCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	releaseDifferent, err := upstream.acquireGenerate(differentCtx, &protocol.Request{PromptCacheKey: "session-b"})
+	if err != nil {
+		t.Fatalf("independent session was blocked: %v", err)
+	}
+	releaseDifferent()
+	releaseFirst()
+	select {
+	case err := <-sameKey:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("same session did not resume after release")
+	}
+}
+
 func TestSubscriptionRetryExhaustionIsBounded(t *testing.T) {
 	keyring.MockInit()
 	if err := saveAccountCredential(accountCredentials{

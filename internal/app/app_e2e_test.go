@@ -844,6 +844,12 @@ func runEndToEndCodex() int {
 				"id":      request.ID,
 				"result":  map[string]any{},
 			})
+		case "thread/unsubscribe":
+			_ = encoder.Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      request.ID,
+				"result":  map[string]any{},
+			})
 		}
 	}
 	if err := scanner.Err(); err != nil {

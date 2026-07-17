@@ -3,6 +3,7 @@ package protocol
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -215,5 +216,36 @@ func TestToolChoiceAnyRequiresAnAvailableTool(t *testing.T) {
 	}
 	if _, err := ToResponses(req, "gpt-test", "medium"); err == nil {
 		t.Fatal("expected tool_choice any without tools to fail")
+	}
+}
+
+func TestResponsesPreservesSessionCacheTierAndOpenAIReasoning(t *testing.T) {
+	rawSignature := make([]byte, 73)
+	rawSignature[0] = 0x80
+	signature := base64.RawURLEncoding.EncodeToString(rawSignature)
+	req := &Request{
+		PromptCacheKey: "macaz_session_cache",
+		Speed:          "fast",
+		Thinking:       json.RawMessage(`{"type":"adaptive"}`),
+		Messages: []Message{
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"private","signature":` + strconv.Quote(signature) + `}]`)},
+			{Role: "user", Content: json.RawMessage(`"continue"`)},
+		},
+	}
+	translated, err := ToResponses(req, "gpt-test", "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if translated.Body["prompt_cache_key"] != req.PromptCacheKey || translated.Body["service_tier"] != "priority" {
+		t.Fatalf("routing fields = %#v", translated.Body)
+	}
+	include, _ := translated.Body["include"].([]string)
+	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("include = %#v", translated.Body["include"])
+	}
+	input := translated.Body["input"].([]any)
+	reasoning := input[0].(map[string]any)
+	if reasoning["type"] != "reasoning" || reasoning["encrypted_content"] != signature {
+		t.Fatalf("reasoning = %#v", reasoning)
 	}
 }

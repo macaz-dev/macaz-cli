@@ -22,6 +22,8 @@ type ResponsesInput struct {
 	Text               json.RawMessage `json:"text,omitempty"`
 	Metadata           map[string]any  `json:"metadata,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	PromptCacheKey     string          `json:"prompt_cache_key,omitempty"`
+	ServiceTier        string          `json:"service_tier,omitempty"`
 }
 
 func FromResponses(input ResponsesInput) (*Request, error) {
@@ -48,17 +50,19 @@ func FromResponses(input ResponsesInput) (*Request, error) {
 		return nil, err
 	}
 	request := &Request{
-		Model:        strings.TrimSpace(input.Model),
-		MaxTokens:    input.MaxOutputTokens,
-		Messages:     messages,
-		Tools:        tools,
-		ToolChoice:   choice,
-		Stream:       input.Stream,
-		Temperature:  input.Temperature,
-		TopP:         input.TopP,
-		OutputConfig: responseEffort(input.Reasoning),
-		OutputFormat: responseFormat(input.Text),
-		Metadata:     input.Metadata,
+		Model:          strings.TrimSpace(input.Model),
+		MaxTokens:      input.MaxOutputTokens,
+		Messages:       messages,
+		Tools:          tools,
+		ToolChoice:     choice,
+		Stream:         input.Stream,
+		Temperature:    input.Temperature,
+		TopP:           input.TopP,
+		OutputConfig:   responseEffort(input.Reasoning),
+		OutputFormat:   responseFormat(input.Text),
+		Metadata:       input.Metadata,
+		PromptCacheKey: strings.TrimSpace(input.PromptCacheKey),
+		ServiceTier:    strings.TrimSpace(input.ServiceTier),
 	}
 	if system != "" {
 		request.System, _ = json.Marshal(system)

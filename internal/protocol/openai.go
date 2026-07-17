@@ -262,6 +262,12 @@ func ToResponses(req *Request, model, defaultEffort string) (ResponsesRequest, e
 		"store":  false,
 		"stream": req.Stream,
 	}
+	if key := strings.TrimSpace(req.PromptCacheKey); key != "" {
+		body["prompt_cache_key"] = key
+	}
+	if tier := ServiceTier(req); tier != "" {
+		body["service_tier"] = tier
+	}
 	if instructions != "" {
 		body["instructions"] = instructions
 	}
@@ -299,6 +305,7 @@ func ToResponses(req *Request, model, defaultEffort string) (ResponsesRequest, e
 	effort := Effort(req, defaultEffort)
 	if len(req.Thinking) > 0 || effort != "" {
 		body["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
+		body["include"] = []string{"reasoning.encrypted_content"}
 	}
 	if format := responsesFormat(req); format != nil {
 		body["text"] = map[string]any{"format": format}
@@ -391,7 +398,16 @@ func responsesInput(messages []Message, names *ToolNames) ([]any, error) {
 						"arguments": string(arguments),
 					})
 				case "thinking", "redacted_thinking":
-					// Provider-specific thinking signatures are not replayable across vendors.
+					// Only OpenAI/Codex encrypted reasoning is replayable into a
+					// stateless Responses request. Anthropic signatures and Macaz's
+					// synthetic summary marker deliberately fail this validation.
+					if signature := openAIReasoningSignature(block.Signature); signature != "" {
+						flush()
+						input = append(input, map[string]any{
+							"type": "reasoning", "summary": []any{},
+							"encrypted_content": signature,
+						})
+					}
 				default:
 					return nil, fmt.Errorf("unsupported assistant content block %q", block.Type)
 				}
@@ -402,6 +418,25 @@ func responsesInput(messages []Message, names *ToolNames) ([]any, error) {
 		flush()
 	}
 	return input, nil
+}
+
+func openAIReasoningSignature(value string) string {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "gAAAA") || len(value) < 80 || len(value) > 32<<20 {
+		return ""
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		decoded, err = base64.URLEncoding.DecodeString(value)
+	}
+	if err != nil || len(decoded) < 73 || decoded[0] != 0x80 {
+		return ""
+	}
+	ciphertext := len(decoded) - 1 - 8 - 16 - 32
+	if ciphertext <= 0 || ciphertext%16 != 0 {
+		return ""
+	}
+	return value
 }
 
 func sourceURL(source *Source) (string, error) {

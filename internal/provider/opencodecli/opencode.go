@@ -35,7 +35,7 @@ func New(cfg config.Config) *Provider {
 }
 
 func (p *Provider) Name() string {
-	return "OpenCode-CLI"
+	return "OpenCode-CLI (experimental)"
 }
 
 func (p *Provider) Check(ctx context.Context) error {

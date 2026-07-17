@@ -54,6 +54,7 @@ type Config struct {
 	DefaultEffort      string                   `json:"default_effort,omitempty"`
 	ModelMap           map[string]string        `json:"model_map,omitempty"`
 	RequestTimeoutSec  int                      `json:"request_timeout_seconds,omitempty"`
+	MaxConcurrentCLI   int                      `json:"max_concurrent_cli_requests,omitempty"`
 	MaxBodyBytes       int64                    `json:"max_body_bytes,omitempty"`
 }
 
@@ -79,6 +80,7 @@ func Default() Config {
 			"haiku":   "gpt-5.6",
 		},
 		RequestTimeoutSec: 7200,
+		MaxConcurrentCLI:  4,
 		MaxBodyBytes:      64 << 20,
 	}
 }
@@ -279,6 +281,9 @@ func (c *Config) applyDefaults() {
 	if c.RequestTimeoutSec <= 0 {
 		c.RequestTimeoutSec = d.RequestTimeoutSec
 	}
+	if c.MaxConcurrentCLI <= 0 {
+		c.MaxConcurrentCLI = d.MaxConcurrentCLI
+	}
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = d.MaxBodyBytes
 	}
@@ -314,6 +319,9 @@ func (c Config) Validate() error {
 	}
 	if c.RequestTimeoutSec < 1 {
 		return errors.New("request timeout must be positive")
+	}
+	if c.MaxConcurrentCLI < 1 || c.MaxConcurrentCLI > 64 {
+		return errors.New("max concurrent CLI requests must be between 1 and 64")
 	}
 	if c.MaxBodyBytes < 1024 {
 		return errors.New("max body bytes must be at least 1024")
@@ -375,14 +383,17 @@ func (c Config) ForClient(client string) (Config, error) {
 		return result, nil
 	}
 	result.Provider = profile.Provider
-	result.OpenAIBaseURL = firstNonEmpty(profile.OpenAIBaseURL, result.OpenAIBaseURL)
-	result.OpenAIModel = firstNonEmpty(profile.OpenAIModel, result.OpenAIModel)
-	result.OpenRouterBaseURL = firstNonEmpty(profile.OpenRouterBaseURL, result.OpenRouterBaseURL)
-	result.OpenRouterModel = firstNonEmpty(profile.OpenRouterModel, result.OpenRouterModel)
-	result.AnthropicBaseURL = firstNonEmpty(profile.AnthropicBaseURL, result.AnthropicBaseURL)
-	result.AnthropicModel = firstNonEmpty(profile.AnthropicModel, result.AnthropicModel)
+	// A client profile is an isolation boundary. Do not fall back to the
+	// legacy/root model fields here: those belong to the other client and can
+	// leak a Macaz-selected model into the user's normal Codex installation.
+	result.OpenAIBaseURL = firstNonEmpty(profile.OpenAIBaseURL, Default().OpenAIBaseURL)
+	result.OpenAIModel = firstNonEmpty(profile.OpenAIModel, Default().OpenAIModel)
+	result.OpenRouterBaseURL = firstNonEmpty(profile.OpenRouterBaseURL, Default().OpenRouterBaseURL)
+	result.OpenRouterModel = firstNonEmpty(profile.OpenRouterModel, Default().OpenRouterModel)
+	result.AnthropicBaseURL = firstNonEmpty(profile.AnthropicBaseURL, Default().AnthropicBaseURL)
+	result.AnthropicModel = profile.AnthropicModel
 	result.OpenCodeModel = profile.OpenCodeModel
-	result.DefaultEffort = firstNonEmpty(profile.DefaultEffort, result.DefaultEffort)
+	result.DefaultEffort = firstNonEmpty(profile.DefaultEffort, Default().DefaultEffort)
 	if profile.ModelMap != nil {
 		result.ModelMap = cloneStringMap(profile.ModelMap)
 	}

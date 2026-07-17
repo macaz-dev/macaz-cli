@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -143,6 +144,17 @@ func TestCheckModelsAndGenerate(t *testing.T) {
 	}
 	if result.Usage.InputTokens != 11 || result.Usage.OutputTokens != 3 {
 		t.Fatalf("usage = %#v", result.Usage)
+	}
+}
+
+func TestProviderErrorPreservesRetryAfter(t *testing.T) {
+	err := providerError(http.StatusTooManyRequests, http.Header{"Retry-After": []string{"7"}}, []byte(`{"error":{"message":"slow down"}}`))
+	var httpErr *provider.HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if httpErr.RetryAfter != 7*time.Second {
+		t.Fatalf("retry after = %s", httpErr.RetryAfter)
 	}
 }
 
