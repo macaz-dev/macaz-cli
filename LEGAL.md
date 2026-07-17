@@ -39,7 +39,7 @@ Users are responsible for:
 - having authority to install and use each selected client and provider;
 - complying with the current terms, acceptable-use policies, organizational
   policies, licenses, and fees applicable to those products and services;
-- ensuring that gateway use is permitted by their employer or organization;
+- ensuring that macaz use is permitted by their employer or organization;
 - having the rights and permissions needed for prompts, source code, files,
   personal data, and other content sent to a provider;
 - reviewing generated output and tool calls before relying on them; and
@@ -74,7 +74,7 @@ and does not replace the terms between a user and a third-party provider.
 For convenience, Anthropic's current public documents include its
 [Commercial Terms](https://www.anthropic.com/legal/commercial-terms),
 [Consumer Terms](https://www.anthropic.com/legal/consumer-terms), and
-[Claude Code gateway documentation](https://code.claude.com/docs/en/llm-gateway).
+[Claude Code model-provider configuration documentation](https://code.claude.com/docs/en/llm-gateway).
 OpenAI publishes its current
 [Terms of Use](https://openai.com/policies/terms-of-use/) and
 [Services Agreement](https://openai.com/policies/services-agreement/).

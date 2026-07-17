@@ -30,6 +30,27 @@ type Provider struct {
 	modelsAt   time.Time
 }
 
+type capabilitySupport struct {
+	Supported bool `json:"supported"`
+}
+
+type modelCapabilities struct {
+	Effort struct {
+		Supported bool              `json:"supported"`
+		Low       capabilitySupport `json:"low"`
+		Medium    capabilitySupport `json:"medium"`
+		High      capabilitySupport `json:"high"`
+		XHigh     capabilitySupport `json:"xhigh"`
+		Max       capabilitySupport `json:"max"`
+	} `json:"effort"`
+	ImageInput        capabilitySupport `json:"image_input"`
+	PDFInput          capabilitySupport `json:"pdf_input"`
+	StructuredOutputs capabilitySupport `json:"structured_outputs"`
+	Thinking          struct {
+		Supported bool `json:"supported"`
+	} `json:"thinking"`
+}
+
 func New(cfg config.Config) *Provider {
 	return &Provider{
 		cfg: cfg,
@@ -85,9 +106,12 @@ func (p *Provider) Models(ctx context.Context) ([]provider.Model, error) {
 	}
 	var payload struct {
 		Data []struct {
-			ID          string `json:"id"`
-			DisplayName string `json:"display_name"`
-			CreatedAt   string `json:"created_at"`
+			ID             string             `json:"id"`
+			DisplayName    string             `json:"display_name"`
+			CreatedAt      string             `json:"created_at"`
+			MaxInputTokens int64              `json:"max_input_tokens"`
+			MaxTokens      int64              `json:"max_tokens"`
+			Capabilities   *modelCapabilities `json:"capabilities"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -101,23 +125,53 @@ func (p *Provider) Models(ctx context.Context) ([]provider.Model, error) {
 		}
 		created, _ := time.Parse(time.RFC3339, item.CreatedAt)
 		efforts := anthropicEfforts(item.ID)
-		parameters := []string{"tools", "tool_choice", "thinking", "temperature", "top_p", "top_k"}
+		inputModalities := []string{"text", "image", "document"}
+		thinking := true
+		structuredOutputs := false
+		if item.Capabilities != nil {
+			efforts = capabilityEfforts(item.Capabilities)
+			inputModalities = []string{"text"}
+			if item.Capabilities.ImageInput.Supported {
+				inputModalities = append(inputModalities, "image")
+			}
+			if item.Capabilities.PDFInput.Supported {
+				inputModalities = append(inputModalities, "document")
+			}
+			thinking = item.Capabilities.Thinking.Supported
+			structuredOutputs = item.Capabilities.StructuredOutputs.Supported
+		}
+		parameters := []string{"tools", "tool_choice", "temperature", "top_p", "top_k"}
+		if thinking {
+			parameters = append(parameters, "thinking")
+		}
 		if len(efforts) > 0 {
 			parameters = append(parameters, "output_config")
+		}
+		if structuredOutputs {
+			parameters = append(parameters, "output_format")
+		}
+		contextWindow := item.MaxInputTokens
+		if contextWindow <= 0 {
+			contextWindow = 200000
+		}
+		maxOutputTokens := item.MaxTokens
+		if maxOutputTokens <= 0 {
+			maxOutputTokens = int64(anthropicDefaultMaxTokens(item.ID))
 		}
 		models = append(models, provider.Model{
 			ID:                  item.ID,
 			DisplayName:         first(item.DisplayName, item.ID),
 			Default:             item.ID == selected,
 			Efforts:             efforts,
-			InputModalities:     []string{"text", "image", "document"},
+			InputModalities:     inputModalities,
 			OutputModalities:    []string{"text"},
 			SupportedParameters: parameters,
-			ContextWindow:       200000,
-			MaxOutputTokens:     int64(anthropicDefaultMaxTokens(item.ID)),
+			ContextWindow:       contextWindow,
+			MaxOutputTokens:     maxOutputTokens,
 			Created:             created.Unix(),
 			ToolCall:            true,
-			Attachment:          true,
+			StructuredOutput:    structuredOutputs,
+			Attachment:          len(inputModalities) > 1,
 		})
 	}
 	if len(models) == 0 {
@@ -133,10 +187,20 @@ func (p *Provider) Generate(ctx context.Context, request *protocol.Request, emit
 	if err != nil {
 		return protocol.Result{}, err
 	}
-	req.Model = p.cfg.ResolveModel(request.Model)
-	configureAnthropicRequest(req)
+	// The local server has already resolved the client-facing model ID to the
+	// exact Anthropic catalog ID. Resolving it again would turn any explicit
+	// claude-* selection back into the configured default.
+	req.Model = strings.TrimSpace(request.Model)
+	if req.Model == "" {
+		req.Model = p.cfg.ResolveModel("default")
+	}
+	p.configureAnthropicRequest(req)
 	if req.MaxTokens <= 0 {
-		req.MaxTokens = anthropicDefaultMaxTokens(req.Model)
+		if model, ok := p.modelInfo(req.Model); ok && model.MaxOutputTokens > 0 {
+			req.MaxTokens = int(model.MaxOutputTokens)
+		} else {
+			req.MaxTokens = anthropicDefaultMaxTokens(req.Model)
+		}
 	}
 	req.Stream = true
 	raw, err := json.Marshal(req)
@@ -173,8 +237,11 @@ func (p *Provider) CountTokens(ctx context.Context, request *protocol.Request) (
 	if err != nil {
 		return 0, false, err
 	}
-	req.Model = p.cfg.ResolveModel(request.Model)
-	configureAnthropicRequest(req)
+	req.Model = strings.TrimSpace(request.Model)
+	if req.Model == "" {
+		req.Model = p.cfg.ResolveModel("default")
+	}
+	p.configureAnthropicRequest(req)
 	req.Stream = false
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -207,6 +274,54 @@ func (p *Provider) CountTokens(ctx context.Context, request *protocol.Request) (
 		return 0, false, fmt.Errorf("decode Anthropic token count: %w", err)
 	}
 	return payload.InputTokens, false, nil
+}
+
+func (p *Provider) configureAnthropicRequest(req *protocol.Request) {
+	if model, ok := p.modelInfo(req.Model); ok {
+		if len(model.Efforts) == 0 {
+			req.OutputConfig = nil
+			return
+		}
+		if len(req.OutputConfig) > 0 && len(req.Thinking) == 0 && anthropicUsesAdaptiveThinking(req.Model) {
+			req.Thinking = json.RawMessage(`{"type":"adaptive"}`)
+		}
+		return
+	}
+	configureAnthropicRequest(req)
+}
+
+func (p *Provider) modelInfo(id string) (provider.Model, bool) {
+	p.modelMu.Lock()
+	defer p.modelMu.Unlock()
+	for _, model := range p.models {
+		if model.ID == id {
+			return model, true
+		}
+	}
+	return provider.Model{}, false
+}
+
+func capabilityEfforts(capabilities *modelCapabilities) []string {
+	if capabilities == nil || !capabilities.Effort.Supported {
+		return nil
+	}
+	levels := []struct {
+		name      string
+		supported bool
+	}{
+		{name: "low", supported: capabilities.Effort.Low.Supported},
+		{name: "medium", supported: capabilities.Effort.Medium.Supported},
+		{name: "high", supported: capabilities.Effort.High.Supported},
+		{name: "xhigh", supported: capabilities.Effort.XHigh.Supported},
+		{name: "max", supported: capabilities.Effort.Max.Supported},
+	}
+	result := make([]string, 0, len(levels))
+	for _, level := range levels {
+		if level.supported {
+			result = append(result, level.name)
+		}
+	}
+	return result
 }
 
 func configureAnthropicRequest(req *protocol.Request) {

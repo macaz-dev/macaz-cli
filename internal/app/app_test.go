@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -189,6 +191,70 @@ func TestUnknownCommandDoesNotStartClaude(t *testing.T) {
 	err := Run(context.Background(), []string{"not-a-command"}, Streams{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}})
 	if err == nil || !strings.Contains(err.Error(), "unknown command") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestWizardOnlyOffersUsefulProvidersForEachClient(t *testing.T) {
+	tests := []struct {
+		client  string
+		present []string
+		absent  []string
+	}{
+		{
+			client:  config.ClientClaude,
+			present: []string{"OpenAI Subscription", "OpenAI API", "OpenRouter API", "Codex-CLI", "OpenCode-CLI"},
+			absent:  []string{"Anthropic API"},
+		},
+		{
+			client:  config.ClientCodex,
+			present: []string{"OpenRouter API", "Anthropic API", "OpenCode-CLI"},
+			absent:  []string{"OpenAI Subscription", "OpenAI API", "Codex-CLI"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.client, func(t *testing.T) {
+			var output bytes.Buffer
+			_, _ = wizard(context.Background(), test.client, config.Default(), Streams{
+				In: strings.NewReader("invalid\n"), Out: &output, Err: &output,
+			})
+			for _, value := range test.present {
+				if !strings.Contains(output.String(), value) {
+					t.Fatalf("wizard is missing %q: %s", value, output.String())
+				}
+			}
+			for _, value := range test.absent {
+				if strings.Contains(output.String(), value) {
+					t.Fatalf("wizard still offers %q: %s", value, output.String())
+				}
+			}
+		})
+	}
+}
+
+func TestAnthropicWizardSelectsDefaultFromLiveCatalog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" || r.Header.Get("x-api-key") != "wizard-anthropic-key" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"claude-current-one","display_name":"Claude Current One"},{"id":"claude-current-two","display_name":"Claude Current Two"}]}`))
+	}))
+	defer server.Close()
+	input := strings.Join([]string{"2", "wizard-anthropic-key", server.URL + "/v1", "2", ""}, "\n")
+	var output bytes.Buffer
+	selected, err := wizard(context.Background(), config.ClientCodex, config.Default(), Streams{
+		In: strings.NewReader(input), Out: &output, Err: &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Provider != config.ProviderAnthropicAPI || selected.AnthropicModel != "claude-current-two" || selected.ResolveModel("default") != "claude-current-two" {
+		t.Fatalf("selected config = %#v", selected)
+	}
+	for _, value := range []string{"Claude Current One", "Claude Current Two"} {
+		if !strings.Contains(output.String(), value) {
+			t.Fatalf("live catalog is missing %q: %s", value, output.String())
+		}
 	}
 }
 

@@ -119,17 +119,18 @@ Available upstreams:
 
 | Provider | Claude client | Codex client |
 | --- | --- | --- |
-| OpenAI Subscription | yes | yes |
-| OpenAI API | yes | yes |
+| OpenAI Subscription | yes | no (use Codex directly) |
+| OpenAI API | yes | no (use Codex directly) |
 | OpenRouter API | yes | yes |
-| Anthropic API | yes | yes |
+| Anthropic API | no (use Claude directly) | yes |
 | Codex CLI provider bridge | yes | no (recursive) |
 | OpenCode CLI provider bridge | yes | yes |
 
 API keys and OAuth credentials are stored in the operating-system credential
 store, not in `config.json`. The Anthropic option uses an Anthropic API key and
 the public Messages API; it does not use or convert a Claude consumer
-subscription.
+subscription. Anthropic model IDs, token limits, input capabilities, and effort
+levels are read from the account's live Models API during setup and startup.
 
 Each start refreshes the active provider catalog. The resulting public model
 IDs and supported reasoning levels are written to the isolated client profile,

@@ -1,7 +1,7 @@
 # Privacy
 
 macaz is a local interoperability tool. The project does not operate a hosted
-model gateway, and the maintainers do not receive model prompts or responses by
+model service, and the maintainers do not receive model prompts or responses by
 default.
 
 ## Data flow
@@ -81,7 +81,7 @@ send project or provider data as part of the update process.
 
 ## Security
 
-The local gateway binds only to loopback and uses a new random authentication
+The local routing layer binds only to loopback and uses a new random authentication
 token for every launch. Configuration and isolated-profile paths use private
 permissions where supported. Secrets should never be committed to source code,
 included in issue reports, or shared in diagnostic output.

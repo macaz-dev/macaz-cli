@@ -379,29 +379,50 @@ func loadOrConfigure(ctx context.Context, client string, streams Streams) (confi
 }
 
 func wizard(ctx context.Context, client string, cfg config.Config, streams Streams) (config.Config, error) {
+	type providerOption struct {
+		label    string
+		provider string
+	}
 	reader := bufio.NewReader(streams.In)
 	legalNotice(streams.Out)
 	_, _ = fmt.Fprintln(streams.Out)
 	_, _ = fmt.Fprintf(streams.Out, "Choose the provider for `macaz %s`:\n", client)
-	_, _ = fmt.Fprintln(streams.Out, "1. OpenAI Subscription")
-	_, _ = fmt.Fprintln(streams.Out, "2. OpenAI API")
-	_, _ = fmt.Fprintln(streams.Out, "3. OpenRouter API")
-	_, _ = fmt.Fprintln(streams.Out, "4. Anthropic API")
-	last := 5
+	var options []providerOption
 	if client == config.ClientClaude {
-		_, _ = fmt.Fprintln(streams.Out, "5. Codex-CLI")
-		_, _ = fmt.Fprintln(streams.Out, "6. OpenCode-CLI")
-		last = 6
+		options = []providerOption{
+			{label: "OpenAI Subscription", provider: config.ProviderOpenAISubscription},
+			{label: "OpenAI API", provider: config.ProviderOpenAIAPIKey},
+			{label: "OpenRouter API", provider: config.ProviderOpenRouterAPI},
+			{label: "Codex-CLI", provider: config.ProviderCodexCLI},
+			{label: "OpenCode-CLI", provider: config.ProviderOpenCodeCLI},
+		}
 	} else {
-		_, _ = fmt.Fprintln(streams.Out, "5. OpenCode-CLI")
+		options = []providerOption{
+			{label: "OpenRouter API", provider: config.ProviderOpenRouterAPI},
+			{label: "Anthropic API", provider: config.ProviderAnthropicAPI},
+			{label: "OpenCode-CLI", provider: config.ProviderOpenCodeCLI},
+		}
 	}
-	choice, err := prompt(reader, streams.Out, fmt.Sprintf("Provider [1-%d]: ", last), "")
+	for index, option := range options {
+		_, _ = fmt.Fprintf(streams.Out, "%d. %s\n", index+1, option.label)
+	}
+	choice, err := prompt(reader, streams.Out, fmt.Sprintf("Provider [1-%d]: ", len(options)), "")
 	if err != nil {
 		return config.Config{}, err
 	}
-	switch strings.TrimSpace(choice) {
-	case "1":
-		cfg.Provider = config.ProviderOpenAISubscription
+	selected := -1
+	for index := range options {
+		if strings.TrimSpace(choice) == fmt.Sprint(index+1) {
+			selected = index
+			break
+		}
+	}
+	if selected < 0 {
+		return config.Config{}, fmt.Errorf("invalid provider choice %q", choice)
+	}
+	cfg.Provider = options[selected].provider
+	switch cfg.Provider {
+	case config.ProviderOpenAISubscription:
 		authCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
 		client := &http.Client{Timeout: 30 * time.Second}
@@ -420,8 +441,7 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 			return config.Config{}, fmt.Errorf("connect OpenAI Subscription: %w", err)
 		}
 		_, _ = fmt.Fprintln(streams.Out, "OpenAI Subscription connected.")
-	case "2":
-		cfg.Provider = config.ProviderOpenAIAPIKey
+	case config.ProviderOpenAIAPIKey:
 		key, err := promptSecret(reader, streams, "OpenAI API key: ")
 		if err != nil {
 			return config.Config{}, err
@@ -429,8 +449,7 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 		if err := secrets.Set(secrets.OpenAIAPIKey, key); err != nil {
 			return config.Config{}, err
 		}
-	case "3":
-		cfg.Provider = config.ProviderOpenRouterAPI
+	case config.ProviderOpenRouterAPI:
 		key, err := promptSecret(reader, streams, "OpenRouter API key: ")
 		if err != nil {
 			return config.Config{}, err
@@ -454,8 +473,7 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 		for _, alias := range []string{"default", "opus", "sonnet", "haiku"} {
 			cfg.ModelMap[alias] = model
 		}
-	case "4":
-		cfg.Provider = config.ProviderAnthropicAPI
+	case config.ProviderAnthropicAPI:
 		key, err := promptSecret(reader, streams, "Anthropic API key: ")
 		if err != nil {
 			return config.Config{}, err
@@ -468,20 +486,39 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 			return config.Config{}, err
 		}
 		cfg.AnthropicBaseURL = baseURL
-		model, err := prompt(reader, streams.Out, "Anthropic model", cfg.AnthropicModel)
+		modelCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		models, err := anthropic.New(cfg).Models(modelCtx)
+		if err != nil {
+			return config.Config{}, fmt.Errorf("list Anthropic models: %w", err)
+		}
+		_, _ = fmt.Fprintln(streams.Out, "Available Anthropic models:")
+		for index, model := range models {
+			label := strings.TrimSpace(model.DisplayName)
+			if label == "" {
+				label = model.ID
+			}
+			_, _ = fmt.Fprintf(streams.Out, "%d. %s (%s)\n", index+1, label, model.ID)
+		}
+		choice, err := prompt(reader, streams.Out, fmt.Sprintf("Anthropic model [1-%d]", len(models)), "1")
 		if err != nil {
 			return config.Config{}, err
 		}
-		cfg.AnthropicModel = model
+		selectedModel := ""
+		for index, model := range models {
+			if strings.TrimSpace(choice) == fmt.Sprint(index+1) {
+				selectedModel = model.ID
+				break
+			}
+		}
+		if selectedModel == "" {
+			return config.Config{}, fmt.Errorf("invalid Anthropic model choice %q", choice)
+		}
+		cfg.AnthropicModel = selectedModel
 		for _, alias := range []string{"default", "opus", "sonnet", "haiku"} {
-			cfg.ModelMap[alias] = model
+			cfg.ModelMap[alias] = selectedModel
 		}
-	case "5":
-		if client == config.ClientCodex {
-			cfg.Provider = config.ProviderOpenCodeCLI
-			return configureOpenCode(cfg, reader, streams)
-		}
-		cfg.Provider = config.ProviderCodexCLI
+	case config.ProviderCodexCLI:
 		value, err := prompt(reader, streams.Out, "Codex executable", cfg.CodexExecutable)
 		if err != nil {
 			return config.Config{}, err
@@ -490,14 +527,8 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 		if _, err := exec.LookPath(value); err != nil {
 			return config.Config{}, fmt.Errorf("Codex executable %q was not found: %w", value, err)
 		}
-	case "6":
-		if client != config.ClientClaude {
-			return config.Config{}, fmt.Errorf("invalid provider choice %q", choice)
-		}
-		cfg.Provider = config.ProviderOpenCodeCLI
+	case config.ProviderOpenCodeCLI:
 		return configureOpenCode(cfg, reader, streams)
-	default:
-		return config.Config{}, fmt.Errorf("invalid provider choice %q", choice)
 	}
 	return cfg, nil
 }

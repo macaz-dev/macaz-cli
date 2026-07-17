@@ -22,7 +22,7 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 		}
 		switch r.URL.Path {
 		case "/v1/models":
-			_, _ = io.WriteString(w, `{"data":[{"id":"claude-test","display_name":"Claude Test","created_at":"2026-01-02T03:04:05Z"}],"has_more":false}`)
+			_, _ = io.WriteString(w, `{"data":[{"id":"claude-test","display_name":"Claude Test","created_at":"2026-01-02T03:04:05Z","max_input_tokens":1000000,"max_tokens":128000,"capabilities":{"effort":{"supported":true,"low":{"supported":true},"medium":{"supported":false},"high":{"supported":true},"xhigh":{"supported":false},"max":{"supported":false}},"image_input":{"supported":true},"pdf_input":{"supported":false},"structured_outputs":{"supported":true},"thinking":{"supported":true}}}],"has_more":false}`)
 		case "/v1/messages/count_tokens":
 			_, _ = io.WriteString(w, `{"input_tokens":17}`)
 		case "/v1/messages":
@@ -63,6 +63,9 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 	models, err := provider.Models(context.Background())
 	if err != nil || len(models) != 1 || models[0].ID != "claude-test" || models[0].DisplayName != "Claude Test" {
 		t.Fatalf("models = %#v, error = %v", models, err)
+	}
+	if models[0].ContextWindow != 1000000 || models[0].MaxOutputTokens != 128000 || !models[0].StructuredOutput || !equalStrings(models[0].Efforts, []string{"low", "high"}) || !equalStrings(models[0].InputModalities, []string{"text", "image"}) {
+		t.Fatalf("live model capabilities were not preserved: %#v", models[0])
 	}
 	request := &protocol.Request{
 		Model: "claude-test", MaxTokens: 100, Stream: true,
@@ -129,6 +132,40 @@ func TestAnthropicModelCapabilitiesAreModelSpecific(t *testing.T) {
 	configureAnthropicRequest(legacy)
 	if len(legacy.OutputConfig) != 0 {
 		t.Fatalf("legacy output config was retained: %s", legacy.OutputConfig)
+	}
+}
+
+func TestGeneratePreservesExplicitAnthropicModelInsteadOfDefault(t *testing.T) {
+	var receivedModel string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request protocol.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		receivedModel = request.Model
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w,
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_switch\",\"model\":\"claude-fable-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n"+
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		)
+	}))
+	defer server.Close()
+	t.Setenv("ANTHROPIC_API_KEY", "anthropic-test-key")
+	cfg := config.Default()
+	cfg.Provider = config.ProviderAnthropicAPI
+	cfg.AnthropicBaseURL = server.URL
+	cfg.AnthropicModel = "claude-sonnet-4-6"
+	cfg.ModelMap = map[string]string{"default": "claude-sonnet-4-6"}
+	provider := New(cfg)
+	_, err := provider.Generate(context.Background(), &protocol.Request{
+		Model: "claude-fable-5", Messages: []protocol.Message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receivedModel != "claude-fable-5" {
+		t.Fatalf("Anthropic request model = %q, want explicit selection", receivedModel)
 	}
 }
 

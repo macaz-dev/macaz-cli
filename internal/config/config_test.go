@@ -116,6 +116,28 @@ func TestCodexClientRejectsRecursiveCodexCLIProvider(t *testing.T) {
 	}
 }
 
+func TestClientProfilesRejectRedundantDirectProviders(t *testing.T) {
+	tests := []struct {
+		client   string
+		provider string
+	}{
+		{client: ClientClaude, provider: ProviderAnthropicAPI},
+		{client: ClientCodex, provider: ProviderOpenAISubscription},
+		{client: ClientCodex, provider: ProviderOpenAIAPIKey},
+	}
+	for _, test := range tests {
+		t.Run(test.client+"-"+test.provider, func(t *testing.T) {
+			cfg := Default()
+			selected := cfg
+			selected.Provider = test.provider
+			cfg.SetClient(test.client, selected)
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("%s client accepted redundant provider %s", test.client, test.provider)
+			}
+		})
+	}
+}
+
 func TestResolveModel(t *testing.T) {
 	cfg := Default()
 	tests := map[string]string{

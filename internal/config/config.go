@@ -70,7 +70,7 @@ func Default() Config {
 		OpenRouterBaseURL:  "https://openrouter.ai/api/v1",
 		OpenRouterModel:    "openai/gpt-5.6-sol",
 		AnthropicBaseURL:   "https://api.anthropic.com/v1",
-		AnthropicModel:     "claude-sonnet-4-6",
+		AnthropicModel:     "",
 		DefaultEffort:      "high",
 		ModelMap: map[string]string{
 			"default": "gpt-5.6",
@@ -291,6 +291,11 @@ func (c Config) Validate() error {
 	if err := validateProvider(c.Provider); err != nil {
 		return err
 	}
+	if strings.TrimSpace(c.Provider) != "" {
+		if err := validateClientProvider(ClientClaude, c.Provider); err != nil {
+			return err
+		}
+	}
 	for client, profile := range c.Clients {
 		if err := ValidateClient(client); err != nil {
 			return err
@@ -298,8 +303,8 @@ func (c Config) Validate() error {
 		if err := validateProvider(profile.Provider); err != nil {
 			return fmt.Errorf("%s client: %w", client, err)
 		}
-		if client == ClientCodex && profile.Provider == ProviderCodexCLI {
-			return errors.New("codex client cannot use Codex CLI as its upstream provider")
+		if err := validateClientProvider(client, profile.Provider); err != nil {
+			return err
 		}
 	}
 	switch c.DefaultEffort {
@@ -314,6 +319,19 @@ func (c Config) Validate() error {
 		return errors.New("max body bytes must be at least 1024")
 	}
 	return nil
+}
+
+func validateClientProvider(client, provider string) error {
+	switch {
+	case client == ClientClaude && provider == ProviderAnthropicAPI:
+		return errors.New("claude client does not need macaz to use the Anthropic API")
+	case client == ClientCodex && (provider == ProviderOpenAISubscription || provider == ProviderOpenAIAPIKey):
+		return errors.New("codex client does not need macaz to use OpenAI")
+	case client == ClientCodex && provider == ProviderCodexCLI:
+		return errors.New("codex client cannot use Codex CLI as its upstream provider")
+	default:
+		return nil
+	}
 }
 
 func ValidateClient(client string) error {

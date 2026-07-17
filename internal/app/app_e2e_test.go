@@ -318,7 +318,7 @@ func TestRunClaudeEndToEndWithHTTPProviders(t *testing.T) {
 	}
 }
 
-func TestRunCodexEndToEndWithInstalledCLI(t *testing.T) {
+func TestRunCodexEndToEndWithOpenRouter(t *testing.T) {
 	codexPath, err := exec.LookPath("codex")
 	if err != nil {
 		t.Skip("Codex CLI is not installed")
@@ -356,8 +356,10 @@ func TestRunCodexEndToEndWithInstalledCLI(t *testing.T) {
 			return
 		}
 		switch r.URL.Path {
+		case "/v1/key":
+			_, _ = io.WriteString(w, `{"data":{"label":"codex-e2e"}}`)
 		case "/v1/models":
-			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-codex-e2e","created":1}]}`)
+			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-codex-e2e","name":"Codex E2E","created":1,"context_length":200000,"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"top_provider":{"max_completion_tokens":32000},"supported_parameters":["tools","tool_choice","reasoning_effort"],"reasoning":{"supported_efforts":["low","high"]}}]}`)
 		case "/v1/responses":
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -411,7 +413,7 @@ func TestRunCodexEndToEndWithInstalledCLI(t *testing.T) {
 	}
 	t.Setenv("MACAZ_CONFIG", filepath.Join(root, "macaz", "config.json"))
 	t.Setenv("CODEX_HOME", filepath.Join(root, "normal-codex"))
-	t.Setenv("OPENAI_API_KEY", "codex-e2e-key")
+	t.Setenv("OPENROUTER_API_KEY", "codex-e2e-key")
 	t.Setenv("MACAZ_NO_UPDATE_CHECK", "1")
 	if err := os.MkdirAll(os.Getenv("CODEX_HOME"), 0o700); err != nil {
 		t.Fatal(err)
@@ -419,9 +421,9 @@ func TestRunCodexEndToEndWithInstalledCLI(t *testing.T) {
 	cfg := config.Default()
 	cfg.CodexExecutable = codexPath
 	selected := cfg
-	selected.Provider = config.ProviderOpenAIAPIKey
-	selected.OpenAIBaseURL = upstream.URL + "/v1"
-	selected.OpenAIModel = "gpt-codex-e2e"
+	selected.Provider = config.ProviderOpenRouterAPI
+	selected.OpenRouterBaseURL = upstream.URL + "/v1"
+	selected.OpenRouterModel = "gpt-codex-e2e"
 	selected.ModelMap = map[string]string{"default": "gpt-codex-e2e"}
 	cfg.SetClient(config.ClientCodex, selected)
 	if err := config.Save(cfg); err != nil {
