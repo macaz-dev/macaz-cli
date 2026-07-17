@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -397,8 +396,15 @@ func (s *Server) installModels(models []provider.Model) ModelCatalog {
 	s.modelMu.Lock()
 	defer s.modelMu.Unlock()
 	s.models = make(map[string]provider.Model, len(models))
+	usedPublicIDs := make(map[string]bool, len(models))
 	for index, model := range models {
-		catalog.IDs[index] = publicModelID(s.client, model.ID, index)
+		baseID := publicModelID(s.client, model.ID, index)
+		publicID := baseID
+		for suffix := 2; usedPublicIDs[publicID]; suffix++ {
+			publicID = baseID + "-" + strconv.Itoa(suffix)
+		}
+		usedPublicIDs[publicID] = true
+		catalog.IDs[index] = publicID
 		catalog.Models[index] = model
 		catalog.Models[index].ID = catalog.IDs[index]
 		catalog.UpstreamByID[catalog.IDs[index]] = model.ID
@@ -574,7 +580,7 @@ func publicModelID(client, providerID string, index int) string {
 		case slug.Len() > 0 && slug.String()[slug.Len()-1] != '-':
 			slug.WriteByte('-')
 		}
-		if slug.Len() >= 36 {
+		if slug.Len() >= 64 {
 			break
 		}
 	}
@@ -582,12 +588,11 @@ func publicModelID(client, providerID string, index int) string {
 	if clean == "" {
 		clean = fmt.Sprintf("model-%d", index+1)
 	}
-	hash := sha256.Sum256([]byte(providerID))
 	prefix := "macaz-"
 	if client == config.ClientClaude {
 		prefix = "claude-macaz-"
 	}
-	return prefix + clean + "-" + hex.EncodeToString(hash[:4])
+	return prefix + clean
 }
 
 func (s *Server) decodeRequest(w http.ResponseWriter, r *http.Request) (*protocol.Request, error) {

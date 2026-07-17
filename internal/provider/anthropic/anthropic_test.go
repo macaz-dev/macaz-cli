@@ -66,8 +66,9 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 	}
 	request := &protocol.Request{
 		Model: "claude-test", MaxTokens: 100, Stream: true,
-		Messages: []protocol.Message{{Role: "user", Content: json.RawMessage(`"read"`)}},
-		Tools:    []protocol.Tool{{Name: "Read", InputSchema: map[string]any{"type": "object"}}},
+		Messages:     []protocol.Message{{Role: "user", Content: json.RawMessage(`"read"`)}},
+		Tools:        []protocol.Tool{{Name: "Read", InputSchema: map[string]any{"type": "object"}}},
+		OutputConfig: json.RawMessage(`{"effort":"max"}`),
 	}
 	var events []protocol.Event
 	result, err := provider.Generate(context.Background(), request, func(event protocol.Event) error {
@@ -90,4 +91,55 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 	if err != nil || count != 17 || estimated {
 		t.Fatalf("count = %d, estimated = %t, error = %v", count, estimated, err)
 	}
+}
+
+func TestAnthropicModelCapabilitiesAreModelSpecific(t *testing.T) {
+	tests := []struct {
+		model    string
+		efforts  []string
+		adaptive bool
+		max      int
+	}{
+		{model: "claude-opus-4-8", efforts: []string{"low", "medium", "high", "xhigh", "max"}, adaptive: true, max: 32000},
+		{model: "claude-sonnet-4-6", efforts: []string{"low", "medium", "high", "max"}, adaptive: true, max: 32000},
+		{model: "claude-opus-4-5", efforts: []string{"low", "medium", "high"}, max: 32000},
+		{model: "claude-3-5-sonnet-latest", max: 8192},
+		{model: "claude-3-haiku", max: 4096},
+	}
+	for _, test := range tests {
+		t.Run(test.model, func(t *testing.T) {
+			if got := anthropicEfforts(test.model); !equalStrings(got, test.efforts) {
+				t.Fatalf("efforts = %#v, want %#v", got, test.efforts)
+			}
+			if got := anthropicUsesAdaptiveThinking(test.model); got != test.adaptive {
+				t.Fatalf("adaptive = %t, want %t", got, test.adaptive)
+			}
+			if got := anthropicDefaultMaxTokens(test.model); got != test.max {
+				t.Fatalf("max tokens = %d, want %d", got, test.max)
+			}
+		})
+	}
+
+	request := &protocol.Request{Model: "claude-sonnet-4-6", OutputConfig: json.RawMessage(`{"effort":"max"}`)}
+	configureAnthropicRequest(request)
+	if string(request.Thinking) != `{"type":"adaptive"}` {
+		t.Fatalf("thinking = %s", request.Thinking)
+	}
+	legacy := &protocol.Request{Model: "claude-3-haiku", OutputConfig: json.RawMessage(`{"effort":"high"}`)}
+	configureAnthropicRequest(legacy)
+	if len(legacy.OutputConfig) != 0 {
+		t.Fatalf("legacy output config was retained: %s", legacy.OutputConfig)
+	}
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }

@@ -32,6 +32,12 @@ type capturingProvider struct {
 
 type toolCallProvider struct{ fakeProvider }
 
+type collidingModelProvider struct{ fakeProvider }
+
+func (collidingModelProvider) Models(context.Context) ([]provider.Model, error) {
+	return []provider.Model{{ID: "vendor/model", Default: true}, {ID: "vendor-model"}}, nil
+}
+
 func (toolCallProvider) Generate(_ context.Context, req *protocol.Request, emit protocol.EmitFunc) (protocol.Result, error) {
 	if len(req.Tools) == 0 {
 		return protocol.Result{}, errors.New("test request contained no tools")
@@ -153,7 +159,7 @@ func TestCodexResponsesMapsRequestsAndStreamsResponsesEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.IDs) != 1 || !strings.HasPrefix(catalog.Default, "macaz-fake-model-") || strings.HasPrefix(catalog.Default, "claude-") {
+	if len(catalog.IDs) != 1 || catalog.Default != "macaz-fake-model" || strings.HasPrefix(catalog.Default, "claude-") {
 		t.Fatalf("Codex catalog = %#v", catalog)
 	}
 
@@ -195,6 +201,24 @@ func TestCodexResponsesMapsRequestsAndStreamsResponsesEvents(t *testing.T) {
 	want := "response.created,response.output_item.added,response.content_part.added,response.output_text.delta,response.output_text.done,response.content_part.done,response.output_item.done,response.completed"
 	if got != want {
 		t.Fatalf("events = %s, want %s", got, want)
+	}
+}
+
+func TestPublicModelIDsStayReadableAndResolveRareCollisions(t *testing.T) {
+	server, err := NewForClient(config.Default(), collidingModelProvider{}, config.ClientCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := server.PrimeModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"macaz-vendor-model", "macaz-vendor-model-2"}
+	if len(catalog.IDs) != len(want) || catalog.IDs[0] != want[0] || catalog.IDs[1] != want[1] {
+		t.Fatalf("public IDs = %#v, want %#v", catalog.IDs, want)
+	}
+	if catalog.UpstreamByID[want[0]] != "vendor/model" || catalog.UpstreamByID[want[1]] != "vendor-model" {
+		t.Fatalf("upstream mapping = %#v", catalog.UpstreamByID)
 	}
 }
 

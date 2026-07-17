@@ -58,7 +58,8 @@ func Run(ctx context.Context, args []string, streams Streams) error {
 		notifyAvailableUpdate(ctx, streams.Err)
 	}
 	if len(args) == 0 {
-		return runClient(ctx, config.ClientClaude, nil, streams)
+		usage(streams.Out)
+		return nil
 	}
 	switch args[0] {
 	case config.ClientClaude, config.ClientCodex:
@@ -89,7 +90,7 @@ func Run(ctx context.Context, args []string, streams Streams) error {
 		usage(streams.Out)
 		return nil
 	default:
-		return runClient(ctx, config.ClientClaude, args, streams)
+		return fmt.Errorf("unknown command %q; run macaz help for usage", args[0])
 	}
 }
 
@@ -599,7 +600,6 @@ func usage(out io.Writer) {
 	_, _ = fmt.Fprintln(out, `macaz - use your favorite models and providers with your favorite coding agents
 
 Usage:
-  macaz [claude arguments...]       (backward-compatible alias for macaz claude)
   macaz claude [arguments...]
   macaz codex [arguments...]
   macaz status [claude|codex]
@@ -615,7 +615,7 @@ Usage:
 
 func legalNotice(out io.Writer) {
 	_, _ = fmt.Fprintln(out, "macaz is an independent interoperability project. It is not affiliated with, authorized by, endorsed by, or sponsored by Anthropic, OpenAI, or any other client, model, or service provider.")
-	_, _ = fmt.Fprintln(out, "Third-party clients and models are not included and must be obtained separately from authorized sources. You are responsible for complying with each applicable client, provider, account, and organizational agreement.")
+	_, _ = fmt.Fprintln(out, "Third-party clients and models are not included and must be obtained and installed separately from authorized sources. You are responsible for complying with each applicable client, provider, account, and organizational agreement.")
 	_, _ = fmt.Fprintln(out, "See LEGAL.md and PRIVACY.md in the macaz source repository for the complete notices.")
 }
 

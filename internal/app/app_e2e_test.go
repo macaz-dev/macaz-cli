@@ -106,7 +106,7 @@ func TestRunClaudeEndToEndWithLocalCLIProviders(t *testing.T) {
 			var stderr bytes.Buffer
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			if err := Run(ctx, nil, Streams{
+			if err := Run(ctx, []string{"claude"}, Streams{
 				In:  strings.NewReader(""),
 				Out: &stdout,
 				Err: &stderr,
@@ -128,7 +128,7 @@ func TestRunClaudeEndToEndWithLocalCLIProviders(t *testing.T) {
 			if report.BaseURL == "" || !strings.HasPrefix(report.BaseURL, "http://127.0.0.1:") {
 				t.Fatalf("gateway URL = %q", report.BaseURL)
 			}
-			if !strings.HasPrefix(report.Model, "claude-macaz-fake-default-") {
+			if report.Model != "claude-macaz-fake-default" {
 				t.Fatalf("public model = %q", report.Model)
 			}
 			if report.ResponseModel != report.Model {
@@ -275,7 +275,7 @@ func TestRunClaudeEndToEndWithHTTPProviders(t *testing.T) {
 			var output bytes.Buffer
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			if err := Run(ctx, nil, Streams{
+			if err := Run(ctx, []string{"claude"}, Streams{
 				In:  strings.NewReader(""),
 				Out: &output,
 				Err: &output,
@@ -670,7 +670,7 @@ func TestRunClaudeEndToEndWithOpenAISubscription(t *testing.T) {
 	var output bytes.Buffer
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if err := Run(ctx, nil, Streams{
+	if err := Run(ctx, []string{"claude"}, Streams{
 		In:  strings.NewReader(""),
 		Out: &output,
 		Err: &output,

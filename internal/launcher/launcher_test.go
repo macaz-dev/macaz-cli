@@ -127,8 +127,22 @@ func TestCodexUsesIsolatedOfficialProfileAndMappedModelCatalog(t *testing.T) {
 	if err := json.Unmarshal(raw, &report); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(report.Args, []string{"--profile", "macaz", "exec", "hello"}) {
-		t.Fatalf("args = %#v", report.Args)
+	if len(report.Args) < 2 || !slices.Equal(report.Args[len(report.Args)-2:], []string{"exec", "hello"}) {
+		t.Fatalf("client args = %#v", report.Args)
+	}
+	joinedArgs := strings.Join(report.Args, "\n")
+	for _, required := range []string{
+		`model="macaz-primary-a1"`, `model_provider="macaz"`,
+		`model_catalog_json=`, `model_reasoning_effort="high"`,
+		`model_providers.macaz.base_url="http://127.0.0.1:54321/v1"`,
+		`model_providers.macaz.wire_api="responses"`, `web_search="disabled"`,
+	} {
+		if !strings.Contains(joinedArgs, required) {
+			t.Fatalf("runtime arguments are missing %q: %#v", required, report.Args)
+		}
+	}
+	if strings.Contains(joinedArgs, "--profile") {
+		t.Fatalf("Codex still depends on a named profile: %#v", report.Args)
 	}
 	if report.Environment["MACAZ_GATEWAY_TOKEN"] != "loopback-secret" || report.Environment["MACAZ_ACTIVE"] != "1" {
 		t.Fatalf("environment = %#v", report.Environment)
@@ -137,22 +151,11 @@ func TestCodexUsesIsolatedOfficialProfileAndMappedModelCatalog(t *testing.T) {
 	if profileDir == "" || profileDir == sourceProfile {
 		t.Fatalf("isolated CODEX_HOME = %q", profileDir)
 	}
-	profileRaw, err := os.ReadFile(filepath.Join(profileDir, "macaz.config.toml"))
-	if err != nil {
-		t.Fatal(err)
+	if strings.Contains(joinedArgs, "loopback-secret") {
+		t.Fatalf("local token leaked into arguments: %#v", report.Args)
 	}
-	profile := string(profileRaw)
-	for _, required := range []string{
-		`model_provider = "macaz"`, `env_key = "MACAZ_GATEWAY_TOKEN"`,
-		`wire_api = "responses"`, `base_url = "http://127.0.0.1:54321/v1"`,
-		`web_search = "disabled"`,
-	} {
-		if !strings.Contains(profile, required) {
-			t.Fatalf("profile is missing %q: %s", required, profile)
-		}
-	}
-	if strings.Contains(profile, "loopback-secret") {
-		t.Fatalf("gateway token leaked into profile: %s", profile)
+	if _, err := os.Stat(filepath.Join(profileDir, "macaz.config.toml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("obsolete named profile still exists: %v", err)
 	}
 	if copied, err := os.ReadFile(filepath.Join(profileDir, "config.toml")); err != nil || string(copied) != "personality = \"pragmatic\"\n" {
 		t.Fatalf("base config copy = %q, error = %v", copied, err)
@@ -186,6 +189,7 @@ func TestCodexInputModalitiesExcludeUnsupportedProviderKinds(t *testing.T) {
 }
 
 func TestCodexGatewayArgsFailClosed(t *testing.T) {
+	options := Options{BaseURL: "http://127.0.0.1:1234", DefaultModel: "macaz-default"}
 	for _, args := range [][]string{
 		{"--model", "gpt-native"},
 		{"--profile", "other"},
@@ -193,11 +197,11 @@ func TestCodexGatewayArgsFailClosed(t *testing.T) {
 		{"-c", "model_provider=other"},
 		{"--config=model_catalog_json=/tmp/other.json"},
 	} {
-		if _, err := codexGatewayArgs(args); err == nil {
+		if _, err := codexGatewayArgs(args, options, "/tmp/macaz-models.json", "high"); err == nil {
 			t.Fatalf("gateway override was accepted: %#v", args)
 		}
 	}
-	args, err := codexGatewayArgs([]string{"--dangerously-bypass-approvals-and-sandbox", "exec", "hello"})
+	args, err := codexGatewayArgs([]string{"--dangerously-bypass-approvals-and-sandbox", "exec", "hello"}, options, "/tmp/macaz-models.json", "high")
 	if err != nil {
 		t.Fatal(err)
 	}

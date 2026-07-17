@@ -172,6 +172,26 @@ func TestHelpKeepsConfigurationSurfaceMinimal(t *testing.T) {
 	}
 }
 
+func TestRunWithoutCommandShowsHelpInsteadOfStartingAClient(t *testing.T) {
+	var output bytes.Buffer
+	if err := Run(context.Background(), nil, Streams{Out: &output, Err: &bytes.Buffer{}}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "macaz claude") || !strings.Contains(output.String(), "macaz codex") {
+		t.Fatalf("missing explicit client commands: %s", output.String())
+	}
+	if strings.Contains(output.String(), "backward-compatible") {
+		t.Fatalf("help still advertises the removed implicit alias: %s", output.String())
+	}
+}
+
+func TestUnknownCommandDoesNotStartClaude(t *testing.T) {
+	err := Run(context.Background(), []string{"not-a-command"}, Streams{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}})
+	if err == nil || !strings.Contains(err.Error(), "unknown command") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestLegalNoticeIsAvailableFromCLI(t *testing.T) {
 	var output bytes.Buffer
 	if err := Run(context.Background(), []string{"legal"}, Streams{Out: &output}); err != nil {

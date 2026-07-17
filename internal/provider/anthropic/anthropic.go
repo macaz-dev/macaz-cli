@@ -100,14 +100,21 @@ func (p *Provider) Models(ctx context.Context) ([]provider.Model, error) {
 			continue
 		}
 		created, _ := time.Parse(time.RFC3339, item.CreatedAt)
+		efforts := anthropicEfforts(item.ID)
+		parameters := []string{"tools", "tool_choice", "thinking", "temperature", "top_p", "top_k"}
+		if len(efforts) > 0 {
+			parameters = append(parameters, "output_config")
+		}
 		models = append(models, provider.Model{
 			ID:                  item.ID,
 			DisplayName:         first(item.DisplayName, item.ID),
 			Default:             item.ID == selected,
-			Efforts:             []string{"low", "medium", "high", "max"},
+			Efforts:             efforts,
 			InputModalities:     []string{"text", "image", "document"},
 			OutputModalities:    []string{"text"},
-			SupportedParameters: []string{"tools", "tool_choice", "thinking", "temperature", "top_p", "top_k"},
+			SupportedParameters: parameters,
+			ContextWindow:       200000,
+			MaxOutputTokens:     int64(anthropicDefaultMaxTokens(item.ID)),
 			Created:             created.Unix(),
 			ToolCall:            true,
 			Attachment:          true,
@@ -127,8 +134,9 @@ func (p *Provider) Generate(ctx context.Context, request *protocol.Request, emit
 		return protocol.Result{}, err
 	}
 	req.Model = p.cfg.ResolveModel(request.Model)
+	configureAnthropicRequest(req)
 	if req.MaxTokens <= 0 {
-		req.MaxTokens = 32000
+		req.MaxTokens = anthropicDefaultMaxTokens(req.Model)
 	}
 	req.Stream = true
 	raw, err := json.Marshal(req)
@@ -166,6 +174,7 @@ func (p *Provider) CountTokens(ctx context.Context, request *protocol.Request) (
 		return 0, false, err
 	}
 	req.Model = p.cfg.ResolveModel(request.Model)
+	configureAnthropicRequest(req)
 	req.Stream = false
 	raw, err := json.Marshal(req)
 	if err != nil {
@@ -198,6 +207,62 @@ func (p *Provider) CountTokens(ctx context.Context, request *protocol.Request) (
 		return 0, false, fmt.Errorf("decode Anthropic token count: %w", err)
 	}
 	return payload.InputTokens, false, nil
+}
+
+func configureAnthropicRequest(req *protocol.Request) {
+	if len(anthropicEfforts(req.Model)) == 0 {
+		req.OutputConfig = nil
+		return
+	}
+	if len(req.OutputConfig) > 0 && len(req.Thinking) == 0 && anthropicUsesAdaptiveThinking(req.Model) {
+		req.Thinking = json.RawMessage(`{"type":"adaptive"}`)
+	}
+}
+
+func anthropicEfforts(model string) []string {
+	model = normalizedModelID(model)
+	switch {
+	case containsAny(model,
+		"fable-5", "mythos-5", "opus-4-8", "opus-4-7", "sonnet-5"):
+		return []string{"low", "medium", "high", "xhigh", "max"}
+	case containsAny(model, "opus-4-6", "sonnet-4-6"):
+		return []string{"low", "medium", "high", "max"}
+	case strings.Contains(model, "opus-4-5"):
+		return []string{"low", "medium", "high"}
+	default:
+		return nil
+	}
+}
+
+func anthropicUsesAdaptiveThinking(model string) bool {
+	model = normalizedModelID(model)
+	return containsAny(model, "opus-4-6", "sonnet-4-6", "opus-4-7", "opus-4-8")
+}
+
+func anthropicDefaultMaxTokens(model string) int {
+	model = normalizedModelID(model)
+	switch {
+	case strings.Contains(model, "3-5"):
+		return 8192
+	case strings.Contains(model, "-5"), strings.Contains(model, "-4-"), strings.Contains(model, "3-7"):
+		return 32000
+	default:
+		return 4096
+	}
+}
+
+func normalizedModelID(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return strings.NewReplacer(".", "-", "_", "-").Replace(model)
+}
+
+func containsAny(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(value, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Provider) endpoint(path string) string {

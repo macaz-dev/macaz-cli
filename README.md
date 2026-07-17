@@ -134,12 +134,12 @@ subscription.
 Each start refreshes the active provider catalog. The resulting public model
 IDs and supported reasoning levels are written to the isolated client profile,
 so model selection works through Claude Code's or Codex CLI's native `/model`
-interface. Model selection is saved by the client for that isolated profile.
+interface. The configured provider default is selected at launch; interactive
+changes follow the selected client's normal session behavior.
 
 ## Commands
 
 ```text
-macaz                     Start Claude Code (backward-compatible default)
 macaz claude [args...]    Start Claude Code
 macaz codex [args...]     Start Codex CLI
 macaz status [client]     Check the configured provider and model catalog

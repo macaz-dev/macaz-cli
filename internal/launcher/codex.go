@@ -22,7 +22,8 @@ func Codex(ctx context.Context, cfg config.Config, options Options) error {
 	if err != nil {
 		return fmt.Errorf("prepare isolated Codex profile: %w", err)
 	}
-	args, err := codexGatewayArgs(options.Args)
+	catalogPath := filepath.Join(profileDir, "macaz-models.json")
+	args, err := codexGatewayArgs(options.Args, options, catalogPath, cfg.DefaultEffort)
 	if err != nil {
 		return err
 	}
@@ -70,9 +71,9 @@ func prepareCodexProfile(cfg config.Config, options Options) (string, error) {
 	if err := writeCodexModelCatalog(catalogPath, options.Models, options.ModelDetails, options.DefaultModel, cfg.DefaultEffort); err != nil {
 		return "", err
 	}
-	profilePath := filepath.Join(profileDir, "macaz.config.toml")
-	profile := codexProfileTOML(options.BaseURL, options.DefaultModel, catalogPath, cfg.DefaultEffort)
-	if err := os.WriteFile(profilePath, []byte(profile), 0o600); err != nil {
+	// Runtime overrides make the selected catalog survive client wrappers that
+	// replace CODEX_HOME. Remove the obsolete named profile from older builds.
+	if err := os.Remove(filepath.Join(profileDir, "macaz.config.toml")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
 	return profileDir, nil
@@ -108,15 +109,6 @@ func syncCodexBaseConfig(sourceDir, profileDir string) error {
 	return os.WriteFile(destination, raw, 0o600)
 }
 
-func codexProfileTOML(baseURL, model, catalogPath, effort string) string {
-	baseURL = strings.TrimRight(baseURL, "/") + "/v1"
-	effort = codexEffort(effort)
-	return fmt.Sprintf(
-		"model = %q\nmodel_provider = \"macaz\"\nmodel_catalog_json = %q\nmodel_reasoning_effort = %q\nweb_search = \"disabled\"\n\n[model_providers.macaz]\nname = \"macaz model router\"\nbase_url = %q\nenv_key = \"MACAZ_GATEWAY_TOKEN\"\nwire_api = \"responses\"\nrequest_max_retries = 1\nstream_max_retries = 1\nstream_idle_timeout_ms = 300000\n",
-		model, catalogPath, effort, baseURL,
-	)
-}
-
 func writeCodexModelCatalog(path string, models []string, details []provider.Model, defaultModel, effort string) error {
 	if len(models) == 0 {
 		return errors.New("Codex model catalog cannot be empty")
@@ -141,7 +133,7 @@ func writeCodexModelCatalog(path string, models []string, details []provider.Mod
 func codexCatalogModel(model provider.Model, isDefault bool, priority int, effort string) map[string]any {
 	levels := codexReasoningLevels(model.Efforts)
 	if len(levels) == 0 {
-		levels = codexReasoningLevels([]string{"low", "medium", "high", "xhigh"})
+		levels = codexReasoningLevels([]string{"high"})
 	}
 	contextWindow := model.ContextWindow
 	if contextWindow <= 0 {
@@ -153,7 +145,7 @@ func codexCatalogModel(model provider.Model, isDefault bool, priority int, effor
 	}
 	description := strings.TrimSpace(model.Description)
 	if description == "" {
-		description = "Model routed through the local macaz interoperability gateway."
+		description = "Available through Macaz."
 	}
 	inputModalities := codexInputModalities(model.InputModalities)
 	if len(inputModalities) == 0 {
@@ -168,7 +160,7 @@ func codexCatalogModel(model provider.Model, isDefault bool, priority int, effor
 		"slug":                             model.ID,
 		"display_name":                     displayName,
 		"description":                      description,
-		"default_reasoning_level":          codexEffort(effort),
+		"default_reasoning_level":          codexDefaultReasoningLevel(levels, effort),
 		"supported_reasoning_levels":       levels,
 		"shell_type":                       "shell_command",
 		"visibility":                       "list",
@@ -197,6 +189,26 @@ func codexCatalogModel(model provider.Model, isDefault bool, priority int, effor
 		"use_responses_lite":               false,
 		"truncation_policy":                map[string]any{"mode": "tokens", "limit": 10000},
 	}
+}
+
+func codexDefaultReasoningLevel(levels []map[string]string, configured string) string {
+	configured = codexEffort(configured)
+	first := "high"
+	for index, level := range levels {
+		value := level["effort"]
+		if index == 0 && value != "" {
+			first = value
+		}
+		if value == configured {
+			return configured
+		}
+	}
+	for _, level := range levels {
+		if level["effort"] == "high" {
+			return "high"
+		}
+	}
+	return first
 }
 
 func codexInputModalities(values []string) []string {
@@ -250,7 +262,7 @@ func codexEffort(effort string) string {
 	}
 }
 
-func codexGatewayArgs(args []string) ([]string, error) {
+func codexGatewayArgs(args []string, options Options, catalogPath, effort string) ([]string, error) {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		switch {
@@ -274,8 +286,25 @@ func codexGatewayArgs(args []string) ([]string, error) {
 			}
 		}
 	}
-	result := make([]string, 0, len(args)+2)
-	result = append(result, "--profile", "macaz")
+	baseURL := strings.TrimRight(options.BaseURL, "/") + "/v1"
+	overrides := []string{
+		fmt.Sprintf("model=%q", options.DefaultModel),
+		`model_provider="macaz"`,
+		fmt.Sprintf("model_catalog_json=%q", catalogPath),
+		fmt.Sprintf("model_reasoning_effort=%q", codexEffort(effort)),
+		`web_search="disabled"`,
+		`model_providers.macaz.name="Macaz local connection"`,
+		fmt.Sprintf("model_providers.macaz.base_url=%q", baseURL),
+		`model_providers.macaz.env_key="MACAZ_GATEWAY_TOKEN"`,
+		`model_providers.macaz.wire_api="responses"`,
+		`model_providers.macaz.request_max_retries=1`,
+		`model_providers.macaz.stream_max_retries=1`,
+		`model_providers.macaz.stream_idle_timeout_ms=300000`,
+	}
+	result := make([]string, 0, len(args)+len(overrides)*2)
+	for _, override := range overrides {
+		result = append(result, "-c", override)
+	}
 	result = append(result, args...)
 	return result, nil
 }
