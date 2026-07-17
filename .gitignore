@@ -1,0 +1,10 @@
+/dist/
+/dev/
+/prod/
+/.claude/
+/macaz
+/macaz.exe
+*.test
+*.test.exe
+*.out
+.DS_Store
