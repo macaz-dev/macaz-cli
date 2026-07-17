@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -126,7 +127,7 @@ func TestUpdateVerifiesAndReplacesExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o751 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o751 {
 		t.Fatalf("installed mode = %o", info.Mode().Perm())
 	}
 }
