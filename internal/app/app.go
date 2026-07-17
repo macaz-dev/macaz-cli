@@ -20,6 +20,7 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/gateway"
 	"github.com/macaz-dev/macaz-cli/internal/launcher"
 	"github.com/macaz-dev/macaz-cli/internal/provider"
+	"github.com/macaz-dev/macaz-cli/internal/provider/anthropic"
 	"github.com/macaz-dev/macaz-cli/internal/provider/codexcli"
 	openaiadapter "github.com/macaz-dev/macaz-cli/internal/provider/openai"
 	"github.com/macaz-dev/macaz-cli/internal/provider/opencodecli"
@@ -57,15 +58,25 @@ func Run(ctx context.Context, args []string, streams Streams) error {
 		notifyAvailableUpdate(ctx, streams.Err)
 	}
 	if len(args) == 0 {
-		return runClaude(ctx, nil, streams)
+		return runClient(ctx, config.ClientClaude, nil, streams)
 	}
 	switch args[0] {
+	case config.ClientClaude, config.ClientCodex:
+		return runClient(ctx, args[0], args[1:], streams)
 	case "status":
-		return runStatus(ctx, streams)
+		client, err := optionalClient(args[1:])
+		if err != nil {
+			return err
+		}
+		return runStatus(ctx, client, streams)
 	case "doctor":
-		return runDoctor(ctx, streams)
+		client, err := optionalClient(args[1:])
+		if err != nil {
+			return err
+		}
+		return runDoctor(ctx, client, streams)
 	case "reset":
-		return runReset(streams)
+		return runReset(args[1:], streams)
 	case "legal":
 		legalNotice(streams.Out)
 		return nil
@@ -78,7 +89,7 @@ func Run(ctx context.Context, args []string, streams Streams) error {
 		usage(streams.Out)
 		return nil
 	default:
-		return runClaude(ctx, args, streams)
+		return runClient(ctx, config.ClientClaude, args, streams)
 	}
 }
 
@@ -124,7 +135,32 @@ func runUpdate(ctx context.Context, args []string, streams Streams) error {
 	return nil
 }
 
-func runReset(streams Streams) error {
+func runReset(args []string, streams Streams) error {
+	if len(args) > 1 {
+		return errors.New("usage: macaz reset [claude|codex]")
+	}
+	if len(args) == 1 {
+		client := strings.ToLower(strings.TrimSpace(args[0]))
+		if err := config.ValidateClient(client); err != nil {
+			return errors.New("usage: macaz reset [claude|codex]")
+		}
+		cfg, err := config.Load()
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		cfg.RemoveClient(client)
+		if err == nil {
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+		}
+		if err := config.RemoveClientProfile(client); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(streams.Out, "macaz %s configuration and isolated profile were removed.\n", client)
+		_, _ = fmt.Fprintln(streams.Out, "Shared provider credentials and the other client configuration were not changed.")
+		return nil
+	}
 	path, err := config.Path()
 	if err != nil {
 		return err
@@ -135,21 +171,27 @@ func runReset(streams Streams) error {
 	if err := config.RemoveClaudeProfile(); err != nil {
 		return err
 	}
+	if err := config.RemoveCodexProfile(); err != nil {
+		return err
+	}
 	if err := secrets.DeleteAll(); err != nil {
 		return fmt.Errorf("remove macaz credentials: %w", err)
 	}
 	_, _ = fmt.Fprintf(streams.Out, "macaz configuration removed: %s\n", path)
 	_, _ = fmt.Fprintln(streams.Out, "macaz API keys and subscription tokens were removed.")
-	_, _ = fmt.Fprintln(streams.Out, "The isolated macaz Claude profile and its session history were removed.")
-	_, _ = fmt.Fprintln(streams.Out, "Vendor CLI credentials and Claude Code configuration were not changed.")
+	_, _ = fmt.Fprintln(streams.Out, "The isolated macaz Claude and Codex profiles and their session history were removed.")
+	_, _ = fmt.Fprintln(streams.Out, "Vendor CLI credentials and normal client configuration were not changed.")
 	return nil
 }
 
-func runClaude(ctx context.Context, args []string, streams Streams) error {
+func runClient(ctx context.Context, client string, args []string, streams Streams) error {
 	if os.Getenv("MACAZ_ACTIVE") == "1" {
 		return errors.New("macaz is already active in this process environment")
 	}
-	cfg, err := loadOrConfigure(ctx, streams)
+	if err := config.ValidateClient(client); err != nil {
+		return err
+	}
+	cfg, err := loadOrConfigure(ctx, client, streams)
 	if err != nil {
 		return err
 	}
@@ -162,7 +204,7 @@ func runClaude(ctx context.Context, args []string, streams Streams) error {
 	if err := upstream.Check(checkCtx); err != nil {
 		return fmt.Errorf("%s is not ready: %w", upstream.Name(), err)
 	}
-	server, err := gateway.New(cfg, upstream)
+	server, err := gateway.NewForClient(cfg, upstream, client)
 	if err != nil {
 		return err
 	}
@@ -181,27 +223,46 @@ func runClaude(ctx context.Context, args []string, streams Streams) error {
 		defer closeCancel()
 		_ = server.Close(closeCtx)
 	}()
-	_, _ = fmt.Fprintf(streams.Err, "macaz: Claude Code → %s\n", upstream.Name())
-	return launcher.Claude(ctx, cfg, launcher.Options{
+	label := "Claude Code"
+	if client == config.ClientCodex {
+		label = "Codex CLI"
+	}
+	_, _ = fmt.Fprintf(streams.Err, "macaz: %s → %s\n", label, upstream.Name())
+	options := launcher.Options{
 		BaseURL:      server.URL(),
 		Token:        server.Token(),
 		Models:       catalog.IDs,
+		ModelDetails: catalog.Models,
 		DefaultModel: catalog.Default,
 		Args:         args,
 		Stdin:        streams.In,
 		Stdout:       streams.Out,
 		Stderr:       streams.Err,
-	})
+	}
+	if client == config.ClientCodex {
+		return launcher.Codex(ctx, cfg, options)
+	}
+	return launcher.Claude(ctx, cfg, options)
 }
 
-func runStatus(ctx context.Context, streams Streams) error {
+func runStatus(ctx context.Context, client string, streams Streams) error {
 	path, err := config.Path()
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load()
+	root, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if client == "" {
+		client = root.DefaultClient
+	}
+	cfg, err := root.ForClient(client)
+	if err != nil {
+		return err
+	}
+	if cfg.Provider == "" {
+		return fmt.Errorf("%s is not configured; run `macaz %s`", client, client)
 	}
 	upstream, err := makeProvider(cfg)
 	if err != nil {
@@ -221,6 +282,7 @@ func runStatus(ctx context.Context, streams Streams) error {
 		return errors.New("provider returned no models")
 	}
 	_, _ = fmt.Fprintf(streams.Out, "Config: %s\n", path)
+	_, _ = fmt.Fprintf(streams.Out, "Client: %s\n", client)
 	_, _ = fmt.Fprintf(streams.Out, "Provider: %s (OK)\n", upstream.Name())
 	_, _ = fmt.Fprintf(streams.Out, "Model: %s\n", activeModel.ID)
 	_, _ = fmt.Fprintf(streams.Out, "Effort: %s\n", cfg.DefaultEffort)
@@ -243,21 +305,38 @@ func activeProviderModel(models []provider.Model, configured string) (provider.M
 	return provider.Model{}, false
 }
 
-func runDoctor(ctx context.Context, streams Streams) error {
+func runDoctor(ctx context.Context, client string, streams Streams) error {
 	path, err := config.Path()
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load()
+	root, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("config %s: %w", path, err)
 	}
-	_, _ = fmt.Fprintf(streams.Out, "Config: %s\n", path)
-	_, _ = fmt.Fprintf(streams.Out, "Provider: %s\n", cfg.Provider)
-	if err := checkExecutable(ctx, cfg.ClaudeExecutable); err != nil {
-		return fmt.Errorf("Claude executable: %w", err)
+	if client == "" {
+		client = root.DefaultClient
 	}
-	_, _ = fmt.Fprintf(streams.Out, "Claude executable: %s\n", cfg.ClaudeExecutable)
+	cfg, err := root.ForClient(client)
+	if err != nil {
+		return err
+	}
+	if cfg.Provider == "" {
+		return fmt.Errorf("%s is not configured; run `macaz %s`", client, client)
+	}
+	_, _ = fmt.Fprintf(streams.Out, "Config: %s\n", path)
+	_, _ = fmt.Fprintf(streams.Out, "Client: %s\n", client)
+	_, _ = fmt.Fprintf(streams.Out, "Provider: %s\n", cfg.Provider)
+	executable := cfg.ClaudeExecutable
+	label := "Claude"
+	if client == config.ClientCodex {
+		executable = cfg.CodexExecutable
+		label = "Codex"
+	}
+	if err := checkExecutable(ctx, executable); err != nil {
+		return fmt.Errorf("%s executable: %w", label, err)
+	}
+	_, _ = fmt.Fprintf(streams.Out, "%s executable: %s\n", label, executable)
 	upstream, err := makeProvider(cfg)
 	if err != nil {
 		return err
@@ -271,36 +350,51 @@ func runDoctor(ctx context.Context, streams Streams) error {
 	return nil
 }
 
-func loadOrConfigure(ctx context.Context, streams Streams) (config.Config, error) {
-	cfg, err := config.Load()
-	if err == nil && cfg.Provider != "" {
-		return cfg, nil
+func loadOrConfigure(ctx context.Context, client string, streams Streams) (config.Config, error) {
+	root, err := config.Load()
+	if err == nil && root.HasClient(client) {
+		return root.ForClient(client)
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return config.Config{}, err
 	}
-	cfg = config.Default()
-	cfg, err = wizard(ctx, cfg, streams)
+	if errors.Is(err, os.ErrNotExist) {
+		root = config.Default()
+	}
+	selected, selectErr := root.ForClient(client)
+	if selectErr != nil {
+		return config.Config{}, selectErr
+	}
+	selected.Provider = ""
+	selected, err = wizard(ctx, client, selected, streams)
 	if err != nil {
 		return config.Config{}, err
 	}
-	if err := config.Save(cfg); err != nil {
+	root.SetClient(client, selected)
+	if err := config.Save(root); err != nil {
 		return config.Config{}, err
 	}
-	return cfg, nil
+	return selected, nil
 }
 
-func wizard(ctx context.Context, cfg config.Config, streams Streams) (config.Config, error) {
+func wizard(ctx context.Context, client string, cfg config.Config, streams Streams) (config.Config, error) {
 	reader := bufio.NewReader(streams.In)
 	legalNotice(streams.Out)
 	_, _ = fmt.Fprintln(streams.Out)
-	_, _ = fmt.Fprintln(streams.Out, "Choose the provider for `macaz`:")
+	_, _ = fmt.Fprintf(streams.Out, "Choose the provider for `macaz %s`:\n", client)
 	_, _ = fmt.Fprintln(streams.Out, "1. OpenAI Subscription")
 	_, _ = fmt.Fprintln(streams.Out, "2. OpenAI API")
 	_, _ = fmt.Fprintln(streams.Out, "3. OpenRouter API")
-	_, _ = fmt.Fprintln(streams.Out, "4. Codex-CLI")
-	_, _ = fmt.Fprintln(streams.Out, "5. OpenCode-CLI")
-	choice, err := prompt(reader, streams.Out, "Provider [1-5]: ", "")
+	_, _ = fmt.Fprintln(streams.Out, "4. Anthropic API")
+	last := 5
+	if client == config.ClientClaude {
+		_, _ = fmt.Fprintln(streams.Out, "5. Codex-CLI")
+		_, _ = fmt.Fprintln(streams.Out, "6. OpenCode-CLI")
+		last = 6
+	} else {
+		_, _ = fmt.Fprintln(streams.Out, "5. OpenCode-CLI")
+	}
+	choice, err := prompt(reader, streams.Out, fmt.Sprintf("Provider [1-%d]: ", last), "")
 	if err != nil {
 		return config.Config{}, err
 	}
@@ -360,6 +454,32 @@ func wizard(ctx context.Context, cfg config.Config, streams Streams) (config.Con
 			cfg.ModelMap[alias] = model
 		}
 	case "4":
+		cfg.Provider = config.ProviderAnthropicAPI
+		key, err := promptSecret(reader, streams, "Anthropic API key: ")
+		if err != nil {
+			return config.Config{}, err
+		}
+		if err := secrets.Set(secrets.AnthropicAPIKey, key); err != nil {
+			return config.Config{}, err
+		}
+		baseURL, err := prompt(reader, streams.Out, "Anthropic base URL", cfg.AnthropicBaseURL)
+		if err != nil {
+			return config.Config{}, err
+		}
+		cfg.AnthropicBaseURL = baseURL
+		model, err := prompt(reader, streams.Out, "Anthropic model", cfg.AnthropicModel)
+		if err != nil {
+			return config.Config{}, err
+		}
+		cfg.AnthropicModel = model
+		for _, alias := range []string{"default", "opus", "sonnet", "haiku"} {
+			cfg.ModelMap[alias] = model
+		}
+	case "5":
+		if client == config.ClientCodex {
+			cfg.Provider = config.ProviderOpenCodeCLI
+			return configureOpenCode(cfg, reader, streams)
+		}
 		cfg.Provider = config.ProviderCodexCLI
 		value, err := prompt(reader, streams.Out, "Codex executable", cfg.CodexExecutable)
 		if err != nil {
@@ -369,24 +489,32 @@ func wizard(ctx context.Context, cfg config.Config, streams Streams) (config.Con
 		if _, err := exec.LookPath(value); err != nil {
 			return config.Config{}, fmt.Errorf("Codex executable %q was not found: %w", value, err)
 		}
-	case "5":
+	case "6":
+		if client != config.ClientClaude {
+			return config.Config{}, fmt.Errorf("invalid provider choice %q", choice)
+		}
 		cfg.Provider = config.ProviderOpenCodeCLI
-		value, err := prompt(reader, streams.Out, "OpenCode executable", cfg.OpenCodeExecutable)
-		if err != nil {
-			return config.Config{}, err
-		}
-		cfg.OpenCodeExecutable = value
-		if _, err := exec.LookPath(value); err != nil {
-			return config.Config{}, fmt.Errorf("OpenCode executable %q was not found: %w", value, err)
-		}
-		model, err := prompt(reader, streams.Out, "OpenCode model (provider/model, blank uses OpenCode default)", cfg.OpenCodeModel)
-		if err != nil {
-			return config.Config{}, err
-		}
-		cfg.OpenCodeModel = model
+		return configureOpenCode(cfg, reader, streams)
 	default:
 		return config.Config{}, fmt.Errorf("invalid provider choice %q", choice)
 	}
+	return cfg, nil
+}
+
+func configureOpenCode(cfg config.Config, reader *bufio.Reader, streams Streams) (config.Config, error) {
+	value, err := prompt(reader, streams.Out, "OpenCode executable", cfg.OpenCodeExecutable)
+	if err != nil {
+		return config.Config{}, err
+	}
+	cfg.OpenCodeExecutable = value
+	if _, err := exec.LookPath(value); err != nil {
+		return config.Config{}, fmt.Errorf("OpenCode executable %q was not found: %w", value, err)
+	}
+	model, err := prompt(reader, streams.Out, "OpenCode model (provider/model, blank uses OpenCode default)", cfg.OpenCodeModel)
+	if err != nil {
+		return config.Config{}, err
+	}
+	cfg.OpenCodeModel = model
 	return cfg, nil
 }
 
@@ -448,6 +576,8 @@ func makeProvider(cfg config.Config) (provider.Provider, error) {
 		return opencodecli.New(cfg), nil
 	case config.ProviderOpenRouterAPI:
 		return openrouter.New(cfg), nil
+	case config.ProviderAnthropicAPI:
+		return anthropic.New(cfg), nil
 	default:
 		return nil, fmt.Errorf("unsupported configured provider %q", cfg.Provider)
 	}
@@ -466,24 +596,37 @@ func checkExecutable(ctx context.Context, name string) error {
 }
 
 func usage(out io.Writer) {
-	_, _ = fmt.Fprintln(out, `macaz - use Claude Code with your preferred AI provider
+	_, _ = fmt.Fprintln(out, `macaz - use your favorite models and providers with your favorite coding agents
 
 Usage:
-  macaz [claude arguments...]
-  macaz status
-  macaz doctor
-  macaz reset
+  macaz [claude arguments...]       (backward-compatible alias for macaz claude)
+  macaz claude [arguments...]
+  macaz codex [arguments...]
+  macaz status [claude|codex]
+  macaz doctor [claude|codex]
+  macaz reset [claude|codex]
   macaz legal
   macaz update
   macaz version
 
-`+"`macaz` starts Claude Code directly, keeps its normal permission prompts, and routes only model inference through the selected provider.\n"+
-		"Pass `--dangerously-skip-permissions` explicitly if you want Claude Code's full-permission mode.")
+`+"`macaz` starts the selected client directly, keeps its normal permission prompts, and routes only model inference through the selected provider.\n"+
+		"Any client-specific permission bypass must be passed explicitly by the user.")
 }
 
 func legalNotice(out io.Writer) {
-	_, _ = fmt.Fprintln(out, "macaz is an independent interoperability project. It is not affiliated with, authorized by, endorsed by, or sponsored by Anthropic or any model provider.")
-	_, _ = fmt.Fprintln(out, "Claude Code must be installed separately. You are responsible for complying with Claude Code, provider, and organizational terms.")
+	_, _ = fmt.Fprintln(out, "macaz is an independent interoperability project. It is not affiliated with, authorized by, endorsed by, or sponsored by Anthropic, OpenAI, or any other client, model, or service provider.")
+	_, _ = fmt.Fprintln(out, "Third-party clients and models are not included and must be obtained separately from authorized sources. You are responsible for complying with each applicable client, provider, account, and organizational agreement.")
+	_, _ = fmt.Fprintln(out, "See LEGAL.md and PRIVACY.md in the macaz source repository for the complete notices.")
+}
+
+func optionalClient(args []string) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	if len(args) != 1 || config.ValidateClient(args[0]) != nil {
+		return "", errors.New("expected zero arguments or one client: claude|codex")
+	}
+	return strings.ToLower(strings.TrimSpace(args[0])), nil
 }
 
 func withDefaultStreams(streams Streams) Streams {

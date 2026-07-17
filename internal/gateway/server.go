@@ -24,6 +24,7 @@ import (
 
 type Server struct {
 	cfg      config.Config
+	client   string
 	provider provider.Provider
 	token    string
 	listener net.Listener
@@ -37,6 +38,7 @@ type Server struct {
 
 type ModelCatalog struct {
 	IDs             []string
+	Models          []provider.Model
 	Default         string
 	DefaultUpstream string
 	UpstreamByID    map[string]string
@@ -55,12 +57,20 @@ type sessionStats struct {
 }
 
 func New(cfg config.Config, upstream provider.Provider) (*Server, error) {
+	return NewForClient(cfg, upstream, config.ClientClaude)
+}
+
+func NewForClient(cfg config.Config, upstream provider.Provider, client string) (*Server, error) {
+	if err := config.ValidateClient(client); err != nil {
+		return nil, err
+	}
 	token, err := randomToken()
 	if err != nil {
 		return nil, err
 	}
 	server := &Server{
 		cfg:      cfg,
+		client:   client,
 		provider: upstream,
 		token:    token,
 		models:   map[string]provider.Model{},
@@ -69,6 +79,7 @@ func New(cfg config.Config, upstream provider.Provider) (*Server, error) {
 	mux.HandleFunc("/health", server.handleHealth)
 	mux.HandleFunc("/v1/messages", server.auth(server.handleMessages))
 	mux.HandleFunc("/v1/messages/count_tokens", server.auth(server.handleCountTokens))
+	mux.HandleFunc("/v1/responses", server.auth(server.handleResponses))
 	mux.HandleFunc("/v1/models", server.auth(server.handleModels))
 	mux.HandleFunc("/v1/models/", server.auth(server.handleModel))
 	mux.HandleFunc("/v1/status", server.auth(server.handleStatus))
@@ -379,6 +390,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) installModels(models []provider.Model) ModelCatalog {
 	catalog := ModelCatalog{
 		IDs:          make([]string, len(models)),
+		Models:       make([]provider.Model, len(models)),
 		UpstreamByID: make(map[string]string, len(models)),
 	}
 	selected := strings.TrimSpace(s.cfg.ResolveModel("default"))
@@ -386,7 +398,9 @@ func (s *Server) installModels(models []provider.Model) ModelCatalog {
 	defer s.modelMu.Unlock()
 	s.models = make(map[string]provider.Model, len(models))
 	for index, model := range models {
-		catalog.IDs[index] = publicModelID(model.ID, index)
+		catalog.IDs[index] = publicModelID(s.client, model.ID, index)
+		catalog.Models[index] = model
+		catalog.Models[index].ID = catalog.IDs[index]
 		catalog.UpstreamByID[catalog.IDs[index]] = model.ID
 		s.models[catalog.IDs[index]] = model
 		if catalog.Default == "" && (model.Default || strings.EqualFold(strings.TrimSpace(model.ID), selected)) {
@@ -397,6 +411,9 @@ func (s *Server) installModels(models []provider.Model) ModelCatalog {
 	if catalog.Default == "" && len(catalog.IDs) > 0 {
 		catalog.Default = catalog.IDs[0]
 		catalog.DefaultUpstream = models[0].ID
+	}
+	for index := range catalog.Models {
+		catalog.Models[index].Default = catalog.Models[index].ID == catalog.Default
 	}
 	return catalog
 }
@@ -547,7 +564,7 @@ func restrictRecursiveSubagentTools(req *protocol.Request) {
 	req.Tools = tools
 }
 
-func publicModelID(providerID string, index int) string {
+func publicModelID(client, providerID string, index int) string {
 	lower := strings.ToLower(providerID)
 	var slug strings.Builder
 	for _, char := range lower {
@@ -566,7 +583,11 @@ func publicModelID(providerID string, index int) string {
 		clean = fmt.Sprintf("model-%d", index+1)
 	}
 	hash := sha256.Sum256([]byte(providerID))
-	return "claude-macaz-" + clean + "-" + hex.EncodeToString(hash[:4])
+	prefix := "macaz-"
+	if client == config.ClientClaude {
+		prefix = "claude-macaz-"
+	}
+	return prefix + clean + "-" + hex.EncodeToString(hash[:4])
 }
 
 func (s *Server) decodeRequest(w http.ResponseWriter, r *http.Request) (*protocol.Request, error) {

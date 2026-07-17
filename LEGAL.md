@@ -2,7 +2,7 @@
 
 macaz is an independent, community-maintained interoperability project. It is
 not affiliated with, authorized by, endorsed by, or sponsored by Anthropic,
-OpenAI, OpenRouter, Codex, or OpenCode.
+OpenAI, OpenRouter, or any other client, model, or service provider.
 
 Claude and Claude Code are trademarks of Anthropic PBC. OpenAI and Codex are
 trademarks of OpenAI, L.L.C. Other names and marks belong to their respective
@@ -16,11 +16,17 @@ The Apache-2.0 license applies only to the macaz source code and distributions
 created from it. It does not license Claude Code, provider models, provider
 APIs, third-party trademarks, or any other third-party software or service.
 
-macaz does not include or redistribute Claude Code. Users must obtain and
-install Claude Code separately from an authorized source. macaz starts that
-separate installation without patching its executable and uses its configurable
-gateway interface to translate model requests for a provider selected by the
-user.
+macaz does not include or redistribute Claude Code, Codex CLI, OpenCode, or any
+model. Users must obtain every client separately from an authorized source.
+macaz starts the selected external client without patching its executable and
+uses configurable provider interfaces to translate model requests for a
+provider selected by the user.
+
+When Anthropic API is selected, macaz uses an API credential supplied by the
+user and Anthropic's API endpoints. It does not convert, resell, or grant access
+to a Claude consumer subscription. When OpenAI Subscription is selected, access
+is performed by the user's separately authorized account and remains subject to
+OpenAI's applicable terms and product availability.
 
 Compatibility with a product or protocol does not imply approval by its owner.
 No representation is made that a third party permits every possible use of its
@@ -30,7 +36,7 @@ software, account, subscription, API, model, or service.
 
 Users are responsible for:
 
-- having authority to install and use Claude Code and every selected provider;
+- having authority to install and use each selected client and provider;
 - complying with the current terms, acceptable-use policies, organizational
   policies, licenses, and fees applicable to those products and services;
 - ensuring that gateway use is permitted by their employer or organization;
@@ -53,7 +59,7 @@ semantically identical, and compatibility does not guarantee identical output,
 tool behavior, safety behavior, availability, or performance.
 
 Third-party interfaces and terms can change without notice. The maintainers do
-not guarantee continued compatibility with Claude Code or any provider.
+not guarantee continued compatibility with any client, model, or provider.
 
 ## Warranty and liability
 
@@ -69,4 +75,9 @@ For convenience, Anthropic's current public documents include its
 [Commercial Terms](https://www.anthropic.com/legal/commercial-terms),
 [Consumer Terms](https://www.anthropic.com/legal/consumer-terms), and
 [Claude Code gateway documentation](https://code.claude.com/docs/en/llm-gateway).
-Those documents may change, and the version applicable to each user controls.
+OpenAI publishes its current
+[Terms of Use](https://openai.com/policies/terms-of-use/) and
+[Services Agreement](https://openai.com/policies/services-agreement/).
+These links are provided for convenience, may change, and do not identify which
+terms apply to a particular user; the agreement applicable to that user and use
+case controls.
