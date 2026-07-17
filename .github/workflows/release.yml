@@ -175,6 +175,7 @@ jobs:
             ./scripts/build-release.sh "${RELEASE_TAG}"
 
       - name: Attest production binaries
+        if: github.event.repository.private == false
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ runner.temp }}/macaz-prod/macaz-*

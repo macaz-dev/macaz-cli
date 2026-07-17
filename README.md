@@ -261,8 +261,9 @@ MACAZ_CLAUDE_INTEGRATION=1 go test ./internal/app -run LiveClaudeLifecycle
 
 Every merged pull request on `main` is verified, assigned the next SemVer tag,
 built for all supported platforms, and published as a GitHub Release with
-checksums, provenance, and generated release notes. The default bump is patch;
-the `release:minor` and `release:major` labels select larger bumps.
+checksums, generated release notes, and provenance when the repository is
+public. The default bump is patch; the `release:minor` and `release:major`
+labels select larger bumps.
 
 ## License
 
