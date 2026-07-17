@@ -588,7 +588,7 @@ func publicModelID(client, providerID string, index int) string {
 	if clean == "" {
 		clean = fmt.Sprintf("model-%d", index+1)
 	}
-	prefix := "macaz-"
+	prefix := ""
 	if client == config.ClientClaude {
 		prefix = "claude-macaz-"
 	}

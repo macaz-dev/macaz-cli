@@ -1,5 +1,7 @@
 # macaz
 
+![Claude Code and OpenAI Codex using models through macaz](assets/header.png)
+
 [![CI](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml)
 
 **Use your favorite models and providers with your favorite coding agents.**

@@ -159,7 +159,7 @@ func TestCodexResponsesMapsRequestsAndStreamsResponsesEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog.IDs) != 1 || catalog.Default != "macaz-fake-model" || strings.HasPrefix(catalog.Default, "claude-") {
+	if len(catalog.IDs) != 1 || catalog.Default != "fake-model" || strings.HasPrefix(catalog.Default, "claude-") {
 		t.Fatalf("Codex catalog = %#v", catalog)
 	}
 
@@ -213,7 +213,7 @@ func TestPublicModelIDsStayReadableAndResolveRareCollisions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"macaz-vendor-model", "macaz-vendor-model-2"}
+	want := []string{"vendor-model", "vendor-model-2"}
 	if len(catalog.IDs) != len(want) || catalog.IDs[0] != want[0] || catalog.IDs[1] != want[1] {
 		t.Fatalf("public IDs = %#v, want %#v", catalog.IDs, want)
 	}
