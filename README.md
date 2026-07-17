@@ -1,5 +1,7 @@
 # macaz
 
+[![CI](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml)
+
 macaz keeps Claude Code as the local coding client while routing model inference
 through OpenAI, OpenRouter, Codex CLI, or OpenCode CLI.
 
