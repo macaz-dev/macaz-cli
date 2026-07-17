@@ -57,6 +57,19 @@ macaz contains no project-operated analytics or telemetry client. Download
 hosts and source-code forges may still record ordinary access logs when users
 download source code, release artifacts, or the installer.
 
+Release builds make a short request to the official macaz GitHub Releases page
+on each launch to determine the latest stable version. This request contains no
+macaz configuration, credentials, prompts, responses, source code, or provider
+data. As with any web request, GitHub can receive ordinary connection metadata
+such as the user's IP address and the `macaz/<version>` user-agent. The check is
+best-effort, produces no error when offline, does not download a binary, and can
+be disabled with `MACAZ_NO_UPDATE_CHECK=1`.
+
+`macaz update` queries the official GitHub release API and downloads
+`SHA256SUMS` plus the platform-specific release binary from GitHub. These
+requests are subject to GitHub's logging and privacy practices. macaz does not
+send project or provider data as part of the update process.
+
 ## Security
 
 The local gateway binds only to loopback and uses a new random authentication

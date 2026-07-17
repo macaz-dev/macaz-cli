@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,27 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/config"
 	"github.com/macaz-dev/macaz-cli/internal/provider"
 	"github.com/macaz-dev/macaz-cli/internal/secrets"
+	"github.com/macaz-dev/macaz-cli/internal/updater"
 )
+
+type fakeUpdateClient struct {
+	checkResult  updater.Release
+	checkErr     error
+	updateResult updater.Result
+	updateErr    error
+	checks       int
+	updates      int
+}
+
+func (client *fakeUpdateClient) Check(context.Context) (updater.Release, error) {
+	client.checks++
+	return client.checkResult, client.checkErr
+}
+
+func (client *fakeUpdateClient) Update(context.Context) (updater.Result, error) {
+	client.updates++
+	return client.updateResult, client.updateErr
+}
 
 func init() {
 	keyring.MockInit()
@@ -97,6 +118,9 @@ func TestHelpKeepsConfigurationSurfaceMinimal(t *testing.T) {
 			t.Fatalf("help still advertises removed command %q: %s", removed, output.String())
 		}
 	}
+	if !strings.Contains(output.String(), "macaz update") {
+		t.Fatalf("help does not advertise self-update: %s", output.String())
+	}
 }
 
 func TestLegalNoticeIsAvailableFromCLI(t *testing.T) {
@@ -109,4 +133,96 @@ func TestLegalNoticeIsAvailableFromCLI(t *testing.T) {
 			t.Fatalf("legal notice is missing %q: %s", required, output.String())
 		}
 	}
+}
+
+func TestRunNotifiesWhenUpdateIsAvailable(t *testing.T) {
+	fake := &fakeUpdateClient{checkResult: updater.Release{
+		Current:   "v1.2.3",
+		Latest:    "v1.2.4",
+		Available: true,
+	}}
+	restoreUpdaterGlobals(t, "v1.2.3", fake)
+	var output bytes.Buffer
+	var errorOutput bytes.Buffer
+	if err := Run(context.Background(), []string{"help"}, Streams{Out: &output, Err: &errorOutput}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.checks != 1 || fake.updates != 0 {
+		t.Fatalf("checks = %d, updates = %d", fake.checks, fake.updates)
+	}
+	for _, required := range []string{"update available", "v1.2.4", "current v1.2.3", "macaz update"} {
+		if !strings.Contains(errorOutput.String(), required) {
+			t.Fatalf("notification is missing %q: %s", required, errorOutput.String())
+		}
+	}
+}
+
+func TestAutomaticUpdateCheckCanBeDisabled(t *testing.T) {
+	fake := &fakeUpdateClient{}
+	restoreUpdaterGlobals(t, "v1.2.3", fake)
+	t.Setenv("MACAZ_NO_UPDATE_CHECK", "1")
+	if err := Run(context.Background(), []string{"help"}, Streams{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.checks != 0 || fake.updates != 0 {
+		t.Fatalf("checks = %d, updates = %d", fake.checks, fake.updates)
+	}
+}
+
+func TestAutomaticUpdateCheckFailureIsSilent(t *testing.T) {
+	fake := &fakeUpdateClient{checkErr: errors.New("network unavailable")}
+	restoreUpdaterGlobals(t, "v1.2.3", fake)
+	var errorOutput bytes.Buffer
+	if err := Run(context.Background(), []string{"help"}, Streams{Out: &bytes.Buffer{}, Err: &errorOutput}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.checks != 1 || errorOutput.Len() != 0 {
+		t.Fatalf("checks = %d, error output = %q", fake.checks, errorOutput.String())
+	}
+}
+
+func TestUpdateCommandReplacesWithoutDuplicateCheck(t *testing.T) {
+	fake := &fakeUpdateClient{updateResult: updater.Result{
+		Current: "v1.2.3",
+		Latest:  "v1.2.4",
+		Path:    "/usr/local/bin/macaz",
+		Updated: true,
+	}}
+	restoreUpdaterGlobals(t, "v1.2.3", fake)
+	var output bytes.Buffer
+	if err := Run(context.Background(), []string{"update"}, Streams{Out: &output, Err: &bytes.Buffer{}}); err != nil {
+		t.Fatal(err)
+	}
+	if fake.checks != 0 || fake.updates != 1 {
+		t.Fatalf("checks = %d, updates = %d", fake.checks, fake.updates)
+	}
+	for _, required := range []string{"Checking for macaz updates", "v1.2.3 → v1.2.4", "/usr/local/bin/macaz"} {
+		if !strings.Contains(output.String(), required) {
+			t.Fatalf("update output is missing %q: %s", required, output.String())
+		}
+	}
+}
+
+func TestUpdateCommandRejectsArguments(t *testing.T) {
+	fake := &fakeUpdateClient{}
+	restoreUpdaterGlobals(t, "v1.2.3", fake)
+	err := Run(context.Background(), []string{"update", "unexpected"}, Streams{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}})
+	if err == nil || !strings.Contains(err.Error(), "usage: macaz update") {
+		t.Fatalf("error = %v", err)
+	}
+	if fake.checks != 0 || fake.updates != 0 {
+		t.Fatalf("checks = %d, updates = %d", fake.checks, fake.updates)
+	}
+}
+
+func restoreUpdaterGlobals(t *testing.T, version string, fake updateClient) {
+	t.Helper()
+	previousVersion := Version
+	previousFactory := newUpdateClient
+	Version = version
+	newUpdateClient = func(string) updateClient { return fake }
+	t.Cleanup(func() {
+		Version = previousVersion
+		newUpdateClient = previousFactory
+	})
 }
