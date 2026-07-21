@@ -299,8 +299,8 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 			t.Fatalf("%s = %q, want %q", key, report.Environment[key], want)
 		}
 	}
-	if report.Environment["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] != "" {
-		t.Fatalf("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT should be unset: %#v", report.Environment)
+	if report.Environment["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] != "1" {
+		t.Fatalf("user-selected CLAUDE_CODE_ALWAYS_ENABLE_EFFORT was not preserved: %#v", report.Environment)
 	}
 	if report.Environment["DISABLE_TELEMETRY"] != "" || report.Environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] != "" {
 		t.Fatalf("feature-flag-disabling environment should be unset: %#v", report.Environment)
@@ -353,6 +353,39 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 	}
 	if _, exists := settings["model"]; exists {
 		t.Fatalf("legacy global gateway model was retained: %#v", settings)
+	}
+}
+
+func TestShouldEnableClaudeEffortOnlyForCapableSelectedModel(t *testing.T) {
+	models := []provider.Model{
+		{ID: "claude-macaz-supported", Efforts: []string{"low", "medium", "high"}},
+		{ID: "claude-macaz-unsupported"},
+	}
+	for _, test := range []struct {
+		name        string
+		selected    string
+		environment []string
+		want        bool
+	}{
+		{name: "supported model", selected: models[0].ID, want: true},
+		{name: "unsupported model", selected: models[1].ID},
+		{name: "unknown model", selected: "claude-macaz-unknown"},
+		{
+			name:        "explicit user enable is preserved",
+			selected:    models[0].ID,
+			environment: []string{"CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1"},
+		},
+		{
+			name:        "explicit user disable is preserved",
+			selected:    models[0].ID,
+			environment: []string{"CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=0"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := shouldEnableClaudeEffort(test.selected, models, test.environment); got != test.want {
+				t.Fatalf("shouldEnableClaudeEffort() = %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 
@@ -421,6 +454,7 @@ func TestClaudePinsInternalModelsWithoutCreatingFamilyAliasRows(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "source-claude"))
 	t.Setenv("MACAZ_FAKE_CLAUDE", "1")
 	t.Setenv("MACAZ_FAKE_CLAUDE_REPORT", reportPath)
+	t.Setenv("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT", "")
 	cfg := config.Default()
 	cfg.ClaudeExecutable = os.Args[0]
 	models := []string{"claude-macaz-sol", "claude-macaz-terra"}
@@ -468,6 +502,9 @@ func TestClaudePinsInternalModelsWithoutCreatingFamilyAliasRows(t *testing.T) {
 	}
 	if report.Environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "272000" {
 		t.Fatalf("auto compact window = %q", report.Environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+	}
+	if report.Environment["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] != "" {
+		t.Fatalf("Macaz invented CLAUDE_CODE_ALWAYS_ENABLE_EFFORT: %#v", report.Environment)
 	}
 	if report.Environment["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] != "1" {
 		t.Fatalf(

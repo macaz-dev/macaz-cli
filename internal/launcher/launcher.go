@@ -53,7 +53,7 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 	command.Stderr = firstWriter(options.Stderr, os.Stderr)
 	configureGracefulShutdown(command)
 	compactWindow := claudeAutoCompactWindow(launchModel, options.ModelDetails)
-	baseEnvironment := withoutEnvironment(os.Environ(), "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT")
+	baseEnvironment := os.Environ()
 	overrides := map[string]string{
 		"ANTHROPIC_BASE_URL":   options.BaseURL,
 		"ANTHROPIC_AUTH_TOKEN": options.Token,
@@ -83,6 +83,9 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 	if compactWindow != "" {
 		overrides["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = compactWindow
 	}
+	if shouldEnableClaudeEffort(launchModel, options.ModelDetails, baseEnvironment) {
+		overrides["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
+	}
 	command.Env = withEnvironment(baseEnvironment, overrides)
 	defer stopClaudeDaemon(executable, command.Env)
 	defer restoreTerminalAfterClaude(command.Stdin, command.Stdout, command.Stderr)()
@@ -102,6 +105,21 @@ func claudeAutoCompactWindow(selected string, models []provider.Model) string {
 		}
 	}
 	return ""
+}
+
+func shouldEnableClaudeEffort(selected string, models []provider.Model, environment []string) bool {
+	const key = "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"
+	for _, item := range environment {
+		if item == key || strings.HasPrefix(item, key+"=") {
+			return false
+		}
+	}
+	for _, model := range models {
+		if model.ID == selected {
+			return len(model.Efforts) > 0
+		}
+	}
+	return false
 }
 
 func restoreTerminalAfterClaude(stdin io.Reader, stdout, stderr io.Writer) func() {
@@ -640,24 +658,6 @@ func withEnvironment(current []string, overrides map[string]string) []string {
 	}
 	for key, value := range overrides {
 		result = append(result, key+"="+value)
-	}
-	return result
-}
-
-func withoutEnvironment(current []string, keys ...string) []string {
-	removed := make(map[string]bool, len(keys))
-	for _, key := range keys {
-		removed[key] = true
-	}
-	result := make([]string, 0, len(current))
-	for _, item := range current {
-		key := item
-		if index := strings.IndexByte(item, '='); index >= 0 {
-			key = item[:index]
-		}
-		if !removed[key] {
-			result = append(result, item)
-		}
 	}
 	return result
 }
