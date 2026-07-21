@@ -88,6 +88,13 @@ func TestRunClaudeEndToEndWithLocalCLIProviders(t *testing.T) {
 			t.Setenv("MACAZ_APP_E2E_PROVIDER", test.provider)
 			t.Setenv("MACAZ_APP_E2E_REPORT", reportPath)
 			t.Setenv("MACAZ_APP_E2E_DAEMON_MARKER", daemonMarker)
+			if test.provider == config.ProviderCodexCLI {
+				catalog := filepath.Join(root, "models_cache.json")
+				if err := os.WriteFile(catalog, []byte(`{"models":[{"slug":"fake/default","display_name":"Fake Default"}]}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("MACAZ_CODEX_MODEL_CATALOG", catalog)
+			}
 
 			cfg := config.Default()
 			cfg.Provider = test.provider
