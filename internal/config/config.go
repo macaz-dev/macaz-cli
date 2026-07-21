@@ -73,7 +73,7 @@ func Default() Config {
 		OpenRouterModel:    "openai/gpt-5.6-sol",
 		AnthropicBaseURL:   "https://api.anthropic.com/v1",
 		AnthropicModel:     "",
-		DefaultEffort:      "high",
+		DefaultEffort:      "medium",
 		ModelMap: map[string]string{
 			"default": "gpt-5.6",
 			"opus":    "gpt-5.6",

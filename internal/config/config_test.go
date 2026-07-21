@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+func TestDefaultEffortIsMedium(t *testing.T) {
+	if got := Default().DefaultEffort; got != "medium" {
+		t.Fatalf("default effort = %q", got)
+	}
+}
+
 func TestSaveLoadPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.json")
 	cfg := Default()

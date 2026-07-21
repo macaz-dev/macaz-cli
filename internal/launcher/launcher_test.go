@@ -115,7 +115,7 @@ func TestCodexUsesIsolatedOfficialProfileAndMappedModelCatalog(t *testing.T) {
 		Models:       models,
 		DefaultModel: models[0],
 		ModelDetails: []provider.Model{
-			{ID: models[0], DisplayName: "Primary", Description: "Primary routed model", Default: true, Efforts: []string{"low", "high"}, InputModalities: []string{"text", "image"}, ContextWindow: 128000},
+			{ID: models[0], DisplayName: "Primary", Description: "Primary routed model", Default: true, Efforts: []string{"low", "medium", "high"}, InputModalities: []string{"text", "image"}, ContextWindow: 128000},
 			{ID: models[1], DisplayName: "Secondary", Efforts: []string{"medium"}, InputModalities: []string{"text"}, ContextWindow: 64000},
 		},
 		Args: []string{"exec", "hello"},
@@ -136,7 +136,7 @@ func TestCodexUsesIsolatedOfficialProfileAndMappedModelCatalog(t *testing.T) {
 	joinedArgs := strings.Join(report.Args, "\n")
 	for _, required := range []string{
 		`model="macaz-primary-a1"`, `model_provider="macaz"`,
-		`model_catalog_json=`, `model_reasoning_effort="high"`,
+		`model_catalog_json=`, `model_reasoning_effort="medium"`,
 		`model_providers.macaz.base_url="http://127.0.0.1:54321/v1"`,
 		`model_providers.macaz.wire_api="responses"`, `web_search="disabled"`,
 	} {
@@ -333,7 +333,7 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 	if settings["enforceAvailableModels"] != true {
 		t.Fatalf("isolated model enforcement = %#v", settings)
 	}
-	if settings["effortLevel"] != "high" {
+	if settings["effortLevel"] != "medium" {
 		t.Fatalf("isolated default effort = %#v", settings)
 	}
 	env, _ := settings["env"].(map[string]any)
@@ -376,7 +376,7 @@ func TestConfiguredEffortUpdatesOnceThenPreservesClaudeSelection(t *testing.T) {
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if settings["effortLevel"] != "high" {
+	if settings["effortLevel"] != "medium" {
 		t.Fatalf("initial effort = %#v", settings)
 	}
 
@@ -398,7 +398,7 @@ func TestConfiguredEffortUpdatesOnceThenPreservesClaudeSelection(t *testing.T) {
 		t.Fatalf("Claude-selected effort was overwritten: %#v", settings)
 	}
 
-	cfg.DefaultEffort = "medium"
+	cfg.DefaultEffort = "high"
 	if _, _, err := prepareClaudeProfile(cfg, models, models[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestConfiguredEffortUpdatesOnceThenPreservesClaudeSelection(t *testing.T) {
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if settings["effortLevel"] != "medium" {
+	if settings["effortLevel"] != "high" {
 		t.Fatalf("updated configured effort was not applied: %#v", settings)
 	}
 }

@@ -654,6 +654,201 @@ func TestProviderContinuesPendingDynamicToolOnSameThread(t *testing.T) {
 	}
 }
 
+func TestProviderPreservesQueuedUserMessageByStartingFreshThread(t *testing.T) {
+	reportPath := filepath.Join(t.TempDir(), "report.json")
+	t.Setenv("MACAZ_FAKE_CODEX", "1")
+	t.Setenv("MACAZ_FAKE_CODEX_STRUCTURED_HANDOFF", "1")
+	t.Setenv("MACAZ_FAKE_CODEX_REPORT", reportPath)
+
+	cfg := config.Default()
+	cfg.Provider = config.ProviderCodexCLI
+	cfg.CodexExecutable = os.Args[0]
+	upstream := New(cfg)
+	defer upstream.Close()
+
+	tools := []protocol.Tool{{
+		Name:        "Read",
+		Description: "Read a file",
+		InputSchema: map[string]any{"type": "object"},
+	}}
+	toolChoice := json.RawMessage(`{"type":"tool","name":"Read","disable_parallel_tool_use":true}`)
+	firstRequest := &protocol.Request{
+		Model:          "fake-default",
+		PromptCacheKey: "claude-session/agent-main",
+		Messages:       []protocol.Message{{Role: "user", Content: json.RawMessage(`"read README.md"`)}},
+		Tools:          tools,
+		ToolChoice:     toolChoice,
+	}
+	firstResult, err := upstream.Generate(context.Background(), firstRequest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRaw, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstReport fakeCodexReport
+	if err := json.Unmarshal(firstRaw, &firstReport); err != nil {
+		t.Fatal(err)
+	}
+	assistantContent, err := json.Marshal(firstResult.Blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondResult, err := upstream.Generate(context.Background(), &protocol.Request{
+		Model:          "fake-default",
+		PromptCacheKey: "claude-session/agent-main",
+		Messages: []protocol.Message{
+			{Role: "user", Content: json.RawMessage(`"read README.md"`)},
+			{Role: "assistant", Content: assistantContent},
+			{Role: "user", Content: json.RawMessage(`[
+				{"type":"tool_result","tool_use_id":"call-fake","content":"README contents"},
+				{"type":"text","text":"stop now and explain instead"}
+			]`)},
+		},
+		Tools:      tools,
+		ToolChoice: toolChoice,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondResult.StopReason != "tool_use" {
+		t.Fatalf("second result = %#v", secondResult)
+	}
+	secondRaw, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondReport fakeCodexReport
+	if err := json.Unmarshal(secondRaw, &secondReport); err != nil {
+		t.Fatal(err)
+	}
+	if secondReport.PID == firstReport.PID {
+		t.Fatalf("queued user input incorrectly resumed parked app-server pid %d", secondReport.PID)
+	}
+	turnInput, err := json.Marshal(secondReport.TurnParams["input"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(turnInput, []byte("stop now and explain instead")) {
+		t.Fatalf("queued user input missing from fresh transcript: %s", turnInput)
+	}
+	if secondReport.ToolResults != 0 {
+		t.Fatalf("queued user input was incorrectly sent as a structured resume: %#v", secondReport)
+	}
+}
+
+func TestClaimPendingFallsBackAndClearsIncompleteToolResults(t *testing.T) {
+	cfg := config.Default()
+	upstream := New(cfg)
+	released := 0
+	state := &codexTurnState{
+		release:        func(bool) { released++ },
+		requestDir:     t.TempDir(),
+		shapeSignature: "same-shape",
+		pending: map[string]json.RawMessage{
+			"call-one": json.RawMessage(`1`),
+			"call-two": json.RawMessage(`2`),
+		},
+	}
+	if !state.reserveParked(upstream.parkedSlots) {
+		t.Fatal("failed to reserve parked slot")
+	}
+	upstream.sessions["session"] = state
+
+	claimed, results, resumed, err := upstream.claimPending("session", "same-shape", &protocol.Request{
+		Messages: []protocol.Message{{
+			Role:    "user",
+			Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"call-one","content":"done"}]`),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed != nil || results != nil || resumed {
+		t.Fatalf("incomplete results unexpectedly resumed: state=%#v results=%#v resumed=%v", claimed, results, resumed)
+	}
+	if upstream.sessions["session"] != nil || len(upstream.parkedSlots) != 0 || released != 1 {
+		t.Fatalf("pending state was not cleared: sessions=%#v parked=%d released=%d", upstream.sessions, len(upstream.parkedSlots), released)
+	}
+}
+
+func TestParkPendingReservesOneCLISlotForNewTraffic(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxConcurrentCLI = 4
+	upstream := New(cfg)
+	defer upstream.closePending()
+
+	for index := 0; index < cfg.MaxConcurrentCLI; index++ {
+		state := &codexTurnState{
+			release: func(bool) {},
+			pending: map[string]json.RawMessage{"call": json.RawMessage(`1`)},
+		}
+		preserved, err := upstream.parkPending("session-"+string(rune('a'+index)), state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index < cfg.MaxConcurrentCLI-1 && !preserved {
+			t.Fatalf("park %d was rejected before the reserved slot", index)
+		}
+		if index == cfg.MaxConcurrentCLI-1 {
+			if preserved {
+				t.Fatal("last CLI slot was consumed by a parked turn")
+			}
+			state.cleanup(false)
+		}
+	}
+	if len(upstream.parkedSlots) != cfg.MaxConcurrentCLI-1 {
+		t.Fatalf("parked slots = %d", len(upstream.parkedSlots))
+	}
+}
+
+func TestProviderFallsBackWhenParkingWouldSaturatePool(t *testing.T) {
+	reportPath := filepath.Join(t.TempDir(), "report.json")
+	t.Setenv("MACAZ_FAKE_CODEX", "1")
+	t.Setenv("MACAZ_FAKE_CODEX_STRUCTURED_HANDOFF", "1")
+	t.Setenv("MACAZ_FAKE_CODEX_REPORT", reportPath)
+
+	cfg := config.Default()
+	cfg.Provider = config.ProviderCodexCLI
+	cfg.CodexExecutable = os.Args[0]
+	cfg.MaxConcurrentCLI = 1
+	upstream := New(cfg)
+	defer upstream.Close()
+	req := &protocol.Request{
+		Model:          "fake-default",
+		PromptCacheKey: "claude-session/agent-main",
+		Messages:       []protocol.Message{{Role: "user", Content: json.RawMessage(`"read README.md"`)}},
+		Tools: []protocol.Tool{{
+			Name:        "Read",
+			Description: "Read a file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		ToolChoice: json.RawMessage(`{"type":"tool","name":"Read","disable_parallel_tool_use":true}`),
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		result, err := upstream.Generate(context.Background(), req, nil)
+		if err != nil {
+			t.Fatalf("generate %d: %v", attempt+1, err)
+		}
+		if result.StopReason != "tool_use" {
+			t.Fatalf("generate %d result = %#v", attempt+1, result)
+		}
+	}
+	raw, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report fakeCodexReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.ThreadStarts != 2 || report.TurnStarts != 2 {
+		t.Fatalf("fallback did not keep the single app-server reusable: %#v", report)
+	}
+}
+
 func TestProviderRejectsUnknownModelInsteadOfFallingBack(t *testing.T) {
 	t.Setenv("MACAZ_FAKE_CODEX", "1")
 	cfg := config.Default()

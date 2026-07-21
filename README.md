@@ -204,6 +204,8 @@ The isolated profiles may contain client-owned session history. See
   tool calls remain on the same app-server thread: Claude executes the tool and
   macaz returns its structured result to the pending JSON-RPC call. Pending
   turns are isolated by Claude session and agent and expire after five minutes.
+  Macaz reserves one CLI slot for new traffic; excess pending turns use the
+  safe interrupted-turn fallback instead of starving the pool.
 - OpenCode CLI uses an isolated request-scoped provider configuration. Its
   project tools and context are not exposed as a second agent layer.
 - Claude Code controls skill and subagent fan-out. Parallel subagents and Auto
@@ -215,7 +217,8 @@ The isolated profiles may contain client-owned session history. See
 - Macaz keeps the exact selected model for main, background, classifier, and
   subagent paths. It sets Claude's automatic compact window only when the active
   provider reports a context limit, and caps reasoning effort only for Claude's
-  dedicated conversation-compaction request.
+  dedicated conversation-compaction request. The default reasoning effort is
+  `medium` and can be changed with `default_effort` in `config.json`.
 
 ## Local development
 

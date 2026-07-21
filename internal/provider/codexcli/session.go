@@ -29,6 +29,9 @@ type codexTurnState struct {
 	pending           map[string]json.RawMessage
 	timer             *time.Timer
 	claimed           bool
+	parkMu            sync.Mutex
+	parked            bool
+	parkedSlots       chan struct{}
 	cleanupOnce       sync.Once
 }
 
@@ -37,9 +40,39 @@ func (s *codexTurnState) cleanup(healthy bool) {
 		if s.timer != nil {
 			s.timer.Stop()
 		}
+		s.releaseParked()
 		_ = os.RemoveAll(s.requestDir)
 		s.release(healthy)
 	})
+}
+
+func (s *codexTurnState) reserveParked(slots chan struct{}) bool {
+	s.parkMu.Lock()
+	defer s.parkMu.Unlock()
+	if s.parked {
+		return true
+	}
+	select {
+	case slots <- struct{}{}:
+		s.parked = true
+		s.parkedSlots = slots
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *codexTurnState) releaseParked() {
+	s.parkMu.Lock()
+	if !s.parked {
+		s.parkMu.Unlock()
+		return
+	}
+	slots := s.parkedSlots
+	s.parked = false
+	s.parkedSlots = nil
+	s.parkMu.Unlock()
+	<-slots
 }
 
 func requestShapeSignature(model, system string, tools []map[string]any, policy protocol.ToolPolicy) string {
@@ -58,10 +91,7 @@ func (p *Provider) claimPending(key, signature string, req *protocol.Request) (*
 	if key == "" {
 		return nil, nil, false, nil
 	}
-	results, err := requestToolResults(req)
-	if err != nil {
-		return nil, nil, false, err
-	}
+	results, onlyToolResults, resultsErr := requestToolResults(req)
 
 	p.sessionMu.Lock()
 	state := p.sessions[key]
@@ -79,11 +109,34 @@ func (p *Provider) claimPending(key, signature string, req *protocol.Request) (*
 		state.cleanup(false)
 		return nil, nil, false, nil
 	}
+	if resultsErr != nil {
+		delete(p.sessions, key)
+		p.sessionMu.Unlock()
+		state.cleanup(false)
+		return nil, nil, false, resultsErr
+	}
+	resumeSafe := onlyToolResults && len(results) == len(state.pending)
 	for callID := range state.pending {
 		if _, ok := results[callID]; !ok {
-			p.sessionMu.Unlock()
-			return nil, nil, true, fmt.Errorf("Claude did not return a tool_result for pending Codex call %q", callID)
+			resumeSafe = false
+			break
 		}
+	}
+	for callID := range results {
+		if _, ok := state.pending[callID]; !ok {
+			resumeSafe = false
+			break
+		}
+	}
+	if !resumeSafe {
+		// A queued user message, attachment, cancelled tool, or mismatched result
+		// must not disappear into the structured handoff. Abandon the parked
+		// optimization and let Generate start a new thread from the full
+		// transcript instead.
+		delete(p.sessions, key)
+		p.sessionMu.Unlock()
+		state.cleanup(false)
+		return nil, nil, false, nil
 	}
 	state.claimed = true
 	if state.timer != nil {
@@ -91,18 +144,23 @@ func (p *Provider) claimPending(key, signature string, req *protocol.Request) (*
 		state.timer = nil
 	}
 	p.sessionMu.Unlock()
+	state.releaseParked()
 	return state, results, true, nil
 }
 
-func (p *Provider) parkPending(key string, state *codexTurnState) error {
+func (p *Provider) parkPending(key string, state *codexTurnState) (bool, error) {
 	key = strings.TrimSpace(key)
 	if key == "" || len(state.pending) == 0 {
-		return errors.New("cannot preserve a Codex tool turn without a Claude session key and pending tool calls")
+		return false, errors.New("cannot preserve a Codex tool turn without a Claude session key and pending tool calls")
+	}
+	if !state.reserveParked(p.parkedSlots) {
+		return false, nil
 	}
 	p.sessionMu.Lock()
 	if p.sessionsClosed {
 		p.sessionMu.Unlock()
-		return errors.New("Codex provider is closed")
+		state.releaseParked()
+		return false, errors.New("Codex provider is closed")
 	}
 	previous := p.sessions[key]
 	p.sessions[key] = state
@@ -112,7 +170,7 @@ func (p *Provider) parkPending(key string, state *codexTurnState) error {
 	if previous != nil && previous != state {
 		previous.cleanup(false)
 	}
-	return nil
+	return true, nil
 }
 
 func (p *Provider) finishPending(key string, state *codexTurnState, healthy bool) {
@@ -157,25 +215,32 @@ type dynamicToolResult struct {
 	contentItems []map[string]any
 }
 
-func requestToolResults(req *protocol.Request) (map[string]dynamicToolResult, error) {
+func requestToolResults(req *protocol.Request) (map[string]dynamicToolResult, bool, error) {
 	results := make(map[string]dynamicToolResult)
-	for _, message := range req.Messages {
+	for index := len(req.Messages) - 1; index >= 0; index-- {
+		message := req.Messages[index]
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+			continue
+		}
 		blocks, err := protocol.DecodeBlocks(message.Content)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		onlyToolResults := len(blocks) > 0
 		for _, block := range blocks {
 			if block.Type != "tool_result" || strings.TrimSpace(block.ToolUseID) == "" {
+				onlyToolResults = false
 				continue
 			}
 			items, err := dynamicToolContent(block.Content)
 			if err != nil {
-				return nil, fmt.Errorf("decode tool_result %q: %w", block.ToolUseID, err)
+				return nil, false, fmt.Errorf("decode tool_result %q: %w", block.ToolUseID, err)
 			}
 			results[block.ToolUseID] = dynamicToolResult{success: !block.IsError, contentItems: items}
 		}
+		return results, onlyToolResults, nil
 	}
-	return results, nil
+	return results, false, nil
 }
 
 func dynamicToolContent(raw json.RawMessage) ([]map[string]any, error) {

@@ -34,6 +34,7 @@ type Provider struct {
 	modelsAt       time.Time
 	poolMu         sync.Mutex
 	slots          chan struct{}
+	parkedSlots    chan struct{}
 	idle           chan *appServer
 	servers        map[*appServer]struct{}
 	sessionMu      sync.Mutex
@@ -47,12 +48,14 @@ func New(cfg config.Config) *Provider {
 	if limit < 1 {
 		limit = 1
 	}
+	parkedLimit := limit - 1
 	return &Provider{
-		cfg:      cfg,
-		slots:    make(chan struct{}, limit),
-		idle:     make(chan *appServer, limit),
-		servers:  make(map[*appServer]struct{}),
-		sessions: make(map[string]*codexTurnState),
+		cfg:         cfg,
+		slots:       make(chan struct{}, limit),
+		parkedSlots: make(chan struct{}, parkedLimit),
+		idle:        make(chan *appServer, limit),
+		servers:     make(map[*appServer]struct{}),
+		sessions:    make(map[string]*codexTurnState),
 	}
 }
 
@@ -353,11 +356,14 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 			}
 			result.StopReason = "tool_use"
 			if len(state.pending) > 0 && strings.TrimSpace(req.PromptCacheKey) != "" {
-				if err := p.parkPending(req.PromptCacheKey, state); err != nil {
+				preserved, err := p.parkPending(req.PromptCacheKey, state)
+				if err != nil {
 					return protocol.Result{}, err
 				}
-				parked = true
-				return result, nil
+				if preserved {
+					parked = true
+					return result, nil
+				}
 			}
 			healthy = server.interruptAndQuiesce(ctx, state.threadID, state.turnID)
 			return result, nil
@@ -433,11 +439,14 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 					}
 					result.StopReason = "tool_use"
 					if len(state.pending) > 0 && strings.TrimSpace(req.PromptCacheKey) != "" {
-						if err := p.parkPending(req.PromptCacheKey, state); err != nil {
+						preserved, err := p.parkPending(req.PromptCacheKey, state)
+						if err != nil {
 							return protocol.Result{}, err
 						}
-						parked = true
-						return result, nil
+						if preserved {
+							parked = true
+							return result, nil
+						}
 					}
 					healthy = server.interruptAndQuiesce(ctx, state.threadID, state.turnID)
 					return result, nil
