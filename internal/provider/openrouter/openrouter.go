@@ -21,6 +21,11 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/secrets"
 )
 
+const (
+	responseHeaderTimeout = 60 * time.Second
+	responseIdleTimeout   = 5 * time.Minute
+)
+
 type Provider struct {
 	cfg        config.Config
 	httpClient *http.Client
@@ -30,10 +35,17 @@ type Provider struct {
 }
 
 func New(cfg config.Config) *Provider {
+	transport := http.DefaultTransport
+	if defaultTransport, ok := transport.(*http.Transport); ok {
+		configured := defaultTransport.Clone()
+		configured.ResponseHeaderTimeout = responseHeaderTimeout
+		transport = configured
+	}
 	return &Provider{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: time.Duration(cfg.RequestTimeoutSec) * time.Second,
+			Transport: transport,
+			Timeout:   time.Duration(cfg.RequestTimeoutSec) * time.Second,
 		},
 	}
 }
@@ -172,11 +184,18 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		return protocol.Result{}, provider.InvalidRequest(err)
 	}
 	translated.Body["stream"] = true
+	if sessionID := strings.TrimSpace(req.PromptCacheKey); sessionID != "" {
+		// OpenRouter uses session_id as a sticky routing key across providers,
+		// improving prompt-cache locality without changing the selected model.
+		translated.Body["session_id"] = sessionID
+	}
 	raw, err := json.Marshal(translated.Body)
 	if err != nil {
 		return protocol.Result{}, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("responses"), bytes.NewReader(raw))
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, p.endpoint("responses"), bytes.NewReader(raw))
 	if err != nil {
 		return protocol.Result{}, err
 	}
@@ -191,16 +210,32 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	if err != nil {
 		return protocol.Result{}, fmt.Errorf("OpenRouter request failed: %w", err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		return protocol.Result{}, providerError(resp.StatusCode, resp.Header, body)
 	}
+	resp.Body = openresponses.NewIdleReadCloser(resp.Body, cancelStream, responseIdleTimeout)
+	defer resp.Body.Close()
 	collector := openresponses.NewCollector(model, translated.ToolNames, req.Stream, emit)
-	if err := openresponses.ReadSSE(resp.Body, collector.Handle); err != nil {
+	if err := openresponses.ReadSSE(resp.Body, collector.Handle); err != nil && !errors.Is(err, openresponses.ErrToolCallReady) {
+		if errors.Is(err, openresponses.ErrResponseIdleTimeout) {
+			return protocol.Result{}, provider.Timeout(err.Error())
+		}
+		if provider.IsContextWindowOverflow(err.Error()) {
+			return protocol.Result{}, provider.ContextWindowOverflow(err.Error(), nil)
+		}
+		var streamErr *openresponses.StreamError
+		if errors.As(err, &streamErr) {
+			return protocol.Result{}, provider.StreamFailure(first(streamErr.Type, streamErr.Code), streamErr.Message)
+		}
 		return protocol.Result{}, err
 	}
-	return collector.Result(), nil
+	result, err := collector.Finalize()
+	if err == nil && result.Usage.Estimated && result.Usage.InputTokens == 0 {
+		result.Usage.InputTokens = int64(protocol.EstimateInputTokens(req))
+	}
+	return result, err
 }
 
 func (p *Provider) CountTokens(_ context.Context, req *protocol.Request) (int, bool, error) {
@@ -230,6 +265,9 @@ func providerError(status int, header http.Header, raw []byte) error {
 	}
 	if json.Unmarshal(raw, &payload) == nil && payload.Error.Message != "" {
 		message = payload.Error.Message
+	}
+	if provider.IsContextWindowOverflow(message) {
+		return provider.ContextWindowOverflow(message, raw)
 	}
 	return &provider.HTTPError{
 		Status:     status,

@@ -223,6 +223,43 @@ func (a *accountAuth) credentials(ctx context.Context) (accountCredentials, erro
 	return next, nil
 }
 
+// forceRefresh replaces a token rejected by the upstream even when its local
+// expiry still says it is valid. The rejected token comparison makes concurrent
+// 401s single-flight: waiters reuse the credential refreshed by the first call.
+func (a *accountAuth) forceRefresh(ctx context.Context, rejectedAccess string) (accountCredentials, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	raw, err := secrets.Get(secrets.OpenAIAccount, "")
+	if err != nil {
+		return accountCredentials{}, fmt.Errorf("OpenAI Subscription is not connected: %w", err)
+	}
+	var credential accountCredentials
+	if err := json.Unmarshal([]byte(raw), &credential); err != nil {
+		return accountCredentials{}, fmt.Errorf("decode OpenAI Subscription credential: %w", err)
+	}
+	if credential.Type != accountCredentialType {
+		return accountCredentials{}, errors.New("stored credential is not an OpenAI Subscription credential")
+	}
+	if rejectedAccess != "" && credential.Access != rejectedAccess {
+		return credential, nil
+	}
+	if credential.Refresh == "" {
+		return accountCredentials{}, errors.New("OpenAI Subscription refresh token is missing; reconnect with `macaz provider set`")
+	}
+	tokens, err := a.refresh(ctx, credential.Refresh)
+	if err != nil {
+		return accountCredentials{}, err
+	}
+	if tokens.RefreshToken == "" {
+		tokens.RefreshToken = credential.Refresh
+	}
+	next := credentialFromTokens(tokens, credential.AccountID)
+	if err := saveAccountCredential(next); err != nil {
+		return accountCredentials{}, err
+	}
+	return next, nil
+}
+
 func (a *accountAuth) exchange(ctx context.Context, code, verifier string) (accountTokenResponse, error) {
 	return a.requestToken(ctx, url.Values{
 		"grant_type":    {"authorization_code"},

@@ -27,9 +27,11 @@ import (
 type Mode string
 
 const (
-	ModeAPIKey       Mode = "api-key"
-	ModeSubscription Mode = "subscription"
-	modelsDevURL          = "https://models.dev/api.json"
+	ModeAPIKey            Mode = "api-key"
+	ModeSubscription      Mode = "subscription"
+	modelsDevURL               = "https://models.dev/api.json"
+	responseHeaderTimeout      = 60 * time.Second
+	responseIdleTimeout        = 5 * time.Minute
 )
 
 type Provider struct {
@@ -39,6 +41,7 @@ type Provider struct {
 	account           *accountAuth
 	subscriptionMu    sync.Mutex
 	subscriptionGates map[string]*generateGate
+	subscriptionSlots chan struct{}
 	retryBase         time.Duration
 	modelMu           sync.Mutex
 	models            []provider.Model
@@ -52,7 +55,13 @@ type generateGate struct {
 
 func New(mode Mode, cfg config.Config) (*Provider, error) {
 	timeout := time.Duration(cfg.RequestTimeoutSec) * time.Second
-	client := &http.Client{Timeout: timeout}
+	transport := http.DefaultTransport
+	if defaultTransport, ok := transport.(*http.Transport); ok {
+		configured := defaultTransport.Clone()
+		configured.ResponseHeaderTimeout = responseHeaderTimeout
+		transport = configured
+	}
+	client := &http.Client{Transport: transport, Timeout: timeout}
 	p := &Provider{
 		mode:       mode,
 		cfg:        cfg,
@@ -61,10 +70,14 @@ func New(mode Mode, cfg config.Config) (*Provider, error) {
 	}
 	if mode == ModeSubscription {
 		p.account = newAccountAuth(client)
-		// Keep turns ordered within one Claude session/agent while allowing
-		// independent agents to progress concurrently. Upstream rate limits,
-		// rather than an arbitrary local cap, govern cross-session fan-out.
+		// Keep turns ordered within one Claude session/agent and bound aggregate
+		// account fan-out so a burst of subagents cannot exhaust a subscription.
 		p.subscriptionGates = make(map[string]*generateGate)
+		limit := cfg.MaxConcurrentSubscription
+		if limit < 1 {
+			limit = 1
+		}
+		p.subscriptionSlots = make(chan struct{}, limit)
 	}
 	return p, nil
 }
@@ -353,16 +366,27 @@ func (p *Provider) subscriptionModels(ctx context.Context) ([]provider.Model, er
 	query := endpoint.Query()
 	query.Set("client_version", accountClientVersion)
 	endpoint.RawQuery = query.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	if err := p.authorize(ctx, req); err != nil {
-		return nil, err
-	}
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("list OpenAI Subscription models: %w", err)
+	var resp *http.Response
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.authorize(ctx, req); err != nil {
+			return nil, err
+		}
+		resp, err = p.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list OpenAI Subscription models: %w", err)
+		}
+		if resp.StatusCode != http.StatusUnauthorized || attempt > 0 {
+			break
+		}
+		usedAccess := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+		_ = resp.Body.Close()
+		if _, err := p.account.forceRefresh(ctx, usedAccess); err != nil {
+			return nil, err
+		}
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
@@ -453,16 +477,33 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		return protocol.Result{}, err
 	}
 	defer release()
-	resp, err := p.sendResponsesWithRetry(ctx, raw)
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	resp, err := p.sendResponsesWithRetry(streamCtx, raw)
 	if err != nil {
 		return protocol.Result{}, err
 	}
+	resp.Body = openresponses.NewIdleReadCloser(resp.Body, cancelStream, responseIdleTimeout)
 	defer resp.Body.Close()
 	collector := openresponses.NewCollector(model, translated.ToolNames, req.Stream, emit)
-	if err := openresponses.ReadSSE(resp.Body, collector.Handle); err != nil {
+	if err := openresponses.ReadSSE(resp.Body, collector.Handle); err != nil && !errors.Is(err, openresponses.ErrToolCallReady) {
+		if errors.Is(err, openresponses.ErrResponseIdleTimeout) {
+			return protocol.Result{}, provider.Timeout(err.Error())
+		}
+		if provider.IsContextWindowOverflow(err.Error()) {
+			return protocol.Result{}, provider.ContextWindowOverflow(err.Error(), nil)
+		}
+		var streamErr *openresponses.StreamError
+		if errors.As(err, &streamErr) {
+			return protocol.Result{}, provider.StreamFailure(first(streamErr.Type, streamErr.Code), streamErr.Message)
+		}
 		return protocol.Result{}, err
 	}
-	return collector.Result(), nil
+	result, err := collector.Finalize()
+	if err == nil && result.Usage.Estimated && result.Usage.InputTokens == 0 {
+		result.Usage.InputTokens = int64(protocol.EstimateInputTokens(req))
+	}
+	return result, err
 }
 
 func (p *Provider) acquireGenerate(ctx context.Context, req *protocol.Request) (func(), error) {
@@ -498,7 +539,16 @@ func (p *Provider) acquireGenerate(ctx context.Context, req *protocol.Request) (
 		releaseGate(false)
 		return nil, ctx.Err()
 	}
-	return func() { releaseGate(true) }, nil
+	select {
+	case p.subscriptionSlots <- struct{}{}:
+		return func() {
+			<-p.subscriptionSlots
+			releaseGate(true)
+		}, nil
+	case <-ctx.Done():
+		releaseGate(true)
+		return nil, ctx.Err()
+	}
 }
 
 func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*http.Response, error) {
@@ -511,6 +561,7 @@ func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*ht
 		attempts = subscriptionAttempts
 	}
 	var lastRetry time.Duration
+	authRefreshed := false
 	for attempt := 0; attempt < attempts; attempt++ {
 		httpReq, err := http.NewRequestWithContext(
 			ctx,
@@ -533,8 +584,16 @@ func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*ht
 		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 			return resp, nil
 		}
+		usedAccess := strings.TrimPrefix(httpReq.Header.Get("Authorization"), "Bearer ")
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		_ = resp.Body.Close()
+		if p.mode == ModeSubscription && resp.StatusCode == http.StatusUnauthorized && !authRefreshed && attempt+1 < attempts {
+			authRefreshed = true
+			if _, err := p.account.forceRefresh(ctx, usedAccess); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		lastRetry = responseRetryDelay(resp.Header, attempt, p.retryBase)
 		if p.mode == ModeSubscription && retryableSubscriptionStatus(resp.StatusCode) && attempt+1 < attempts {
 			timer := time.NewTimer(lastRetry)
@@ -546,10 +605,14 @@ func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*ht
 				continue
 			}
 		}
+		message := strings.TrimSpace(string(raw))
+		if provider.IsContextWindowOverflow(message) {
+			return nil, provider.ContextWindowOverflow(message, raw)
+		}
 		return nil, &provider.HTTPError{
 			Status:     resp.StatusCode,
 			Type:       "provider_error",
-			Message:    strings.TrimSpace(string(raw)),
+			Message:    message,
 			Body:       raw,
 			RetryAfter: lastRetry,
 		}

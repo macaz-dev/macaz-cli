@@ -36,26 +36,27 @@ type ClientProfile struct {
 }
 
 type Config struct {
-	Version            int                      `json:"version"`
-	DefaultClient      string                   `json:"default_client,omitempty"`
-	Clients            map[string]ClientProfile `json:"clients,omitempty"`
-	Provider           string                   `json:"provider,omitempty"`
-	ClaudeExecutable   string                   `json:"claude_executable,omitempty"`
-	CodexExecutable    string                   `json:"codex_executable,omitempty"`
-	OpenCodeExecutable string                   `json:"opencode_executable,omitempty"`
-	CodexHome          string                   `json:"codex_home,omitempty"`
-	OpenAIBaseURL      string                   `json:"openai_base_url,omitempty"`
-	OpenAIModel        string                   `json:"openai_model,omitempty"`
-	OpenRouterBaseURL  string                   `json:"openrouter_base_url,omitempty"`
-	OpenRouterModel    string                   `json:"openrouter_model,omitempty"`
-	AnthropicBaseURL   string                   `json:"anthropic_base_url,omitempty"`
-	AnthropicModel     string                   `json:"anthropic_model,omitempty"`
-	OpenCodeModel      string                   `json:"opencode_model,omitempty"`
-	DefaultEffort      string                   `json:"default_effort,omitempty"`
-	ModelMap           map[string]string        `json:"model_map,omitempty"`
-	RequestTimeoutSec  int                      `json:"request_timeout_seconds,omitempty"`
-	MaxConcurrentCLI   int                      `json:"max_concurrent_cli_requests,omitempty"`
-	MaxBodyBytes       int64                    `json:"max_body_bytes,omitempty"`
+	Version                   int                      `json:"version"`
+	DefaultClient             string                   `json:"default_client,omitempty"`
+	Clients                   map[string]ClientProfile `json:"clients,omitempty"`
+	Provider                  string                   `json:"provider,omitempty"`
+	ClaudeExecutable          string                   `json:"claude_executable,omitempty"`
+	CodexExecutable           string                   `json:"codex_executable,omitempty"`
+	OpenCodeExecutable        string                   `json:"opencode_executable,omitempty"`
+	CodexHome                 string                   `json:"codex_home,omitempty"`
+	OpenAIBaseURL             string                   `json:"openai_base_url,omitempty"`
+	OpenAIModel               string                   `json:"openai_model,omitempty"`
+	OpenRouterBaseURL         string                   `json:"openrouter_base_url,omitempty"`
+	OpenRouterModel           string                   `json:"openrouter_model,omitempty"`
+	AnthropicBaseURL          string                   `json:"anthropic_base_url,omitempty"`
+	AnthropicModel            string                   `json:"anthropic_model,omitempty"`
+	OpenCodeModel             string                   `json:"opencode_model,omitempty"`
+	DefaultEffort             string                   `json:"default_effort,omitempty"`
+	ModelMap                  map[string]string        `json:"model_map,omitempty"`
+	RequestTimeoutSec         int                      `json:"request_timeout_seconds,omitempty"`
+	MaxConcurrentCLI          int                      `json:"max_concurrent_cli_requests,omitempty"`
+	MaxConcurrentSubscription int                      `json:"max_concurrent_subscription_requests,omitempty"`
+	MaxBodyBytes              int64                    `json:"max_body_bytes,omitempty"`
 }
 
 func Default() Config {
@@ -79,9 +80,10 @@ func Default() Config {
 			"sonnet":  "gpt-5.6",
 			"haiku":   "gpt-5.6",
 		},
-		RequestTimeoutSec: 7200,
-		MaxConcurrentCLI:  4,
-		MaxBodyBytes:      64 << 20,
+		RequestTimeoutSec:         7200,
+		MaxConcurrentCLI:          4,
+		MaxConcurrentSubscription: 4,
+		MaxBodyBytes:              64 << 20,
 	}
 }
 
@@ -284,6 +286,9 @@ func (c *Config) applyDefaults() {
 	if c.MaxConcurrentCLI <= 0 {
 		c.MaxConcurrentCLI = d.MaxConcurrentCLI
 	}
+	if c.MaxConcurrentSubscription <= 0 {
+		c.MaxConcurrentSubscription = d.MaxConcurrentSubscription
+	}
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = d.MaxBodyBytes
 	}
@@ -322,6 +327,9 @@ func (c Config) Validate() error {
 	}
 	if c.MaxConcurrentCLI < 1 || c.MaxConcurrentCLI > 64 {
 		return errors.New("max concurrent CLI requests must be between 1 and 64")
+	}
+	if c.MaxConcurrentSubscription < 1 || c.MaxConcurrentSubscription > 64 {
+		return errors.New("max concurrent subscription requests must be between 1 and 64")
 	}
 	if c.MaxBodyBytes < 1024 {
 		return errors.New("max body bytes must be at least 1024")

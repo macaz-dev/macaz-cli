@@ -20,7 +20,11 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/secrets"
 )
 
-const anthropicVersion = "2023-06-01"
+const (
+	anthropicVersion      = "2023-06-01"
+	responseHeaderTimeout = 60 * time.Second
+	responseIdleTimeout   = 5 * time.Minute
+)
 
 type Provider struct {
 	cfg        config.Config
@@ -52,10 +56,17 @@ type modelCapabilities struct {
 }
 
 func New(cfg config.Config) *Provider {
+	transport := http.DefaultTransport
+	if defaultTransport, ok := transport.(*http.Transport); ok {
+		configured := defaultTransport.Clone()
+		configured.ResponseHeaderTimeout = responseHeaderTimeout
+		transport = configured
+	}
 	return &Provider{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: time.Duration(cfg.RequestTimeoutSec) * time.Second,
+			Transport: transport,
+			Timeout:   time.Duration(cfg.RequestTimeoutSec) * time.Second,
 		},
 	}
 }
@@ -207,7 +218,9 @@ func (p *Provider) Generate(ctx context.Context, request *protocol.Request, emit
 	if err != nil {
 		return protocol.Result{}, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint("messages"), bytes.NewReader(raw))
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	httpReq, err := http.NewRequestWithContext(streamCtx, http.MethodPost, p.endpoint("messages"), bytes.NewReader(raw))
 	if err != nil {
 		return protocol.Result{}, err
 	}
@@ -220,16 +233,21 @@ func (p *Provider) Generate(ctx context.Context, request *protocol.Request, emit
 	if err != nil {
 		return protocol.Result{}, fmt.Errorf("Anthropic request failed: %w", err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		return protocol.Result{}, providerError(resp.StatusCode, resp.Header, body)
 	}
+	resp.Body = openresponses.NewIdleReadCloser(resp.Body, cancelStream, responseIdleTimeout)
+	defer resp.Body.Close()
 	collector := newCollector(req.Model, names, request.Stream, emit)
 	if err := openresponses.ReadSSE(resp.Body, collector.handle); err != nil {
+		if errors.Is(err, openresponses.ErrResponseIdleTimeout) {
+			return protocol.Result{}, provider.Timeout(err.Error())
+		}
 		return protocol.Result{}, err
 	}
-	return collector.result(), nil
+	return collector.finalize()
 }
 
 func (p *Provider) CountTokens(ctx context.Context, request *protocol.Request) (int, bool, error) {
@@ -406,6 +424,7 @@ type collector struct {
 	arguments  map[int]string
 	stopReason string
 	usage      protocol.Usage
+	terminal   bool
 }
 
 func newCollector(model string, names *protocol.ToolNames, stream bool, emit protocol.EmitFunc) *collector {
@@ -514,7 +533,7 @@ func (c *collector) handle(event string, data []byte) error {
 		if index >= 0 && index < len(c.blocks) && c.blocks[index].Type == "tool_use" {
 			arguments := c.arguments[index]
 			if arguments == "" || !json.Valid([]byte(arguments)) {
-				arguments = "{}"
+				return fmt.Errorf("Anthropic tool %q returned invalid or empty JSON arguments", c.blocks[index].Name)
 			}
 			c.blocks[index].Input = json.RawMessage(arguments)
 		}
@@ -542,8 +561,17 @@ func (c *collector) handle(event string, data []byte) error {
 		}
 		c.usage.CacheCreationInputTokens = usage.CacheCreationInputTokens
 		c.usage.CacheReadInputTokens = usage.CacheReadInputTokens
+	case "message_stop":
+		if len(c.open) != 0 {
+			return errors.New("Anthropic stream stopped with open content blocks")
+		}
+		c.terminal = true
 	case "error":
-		return errors.New(anthropicErrorMessage(data))
+		message := anthropicErrorMessage(data)
+		if provider.IsContextWindowOverflow(message) {
+			return provider.ContextWindowOverflow(message, data)
+		}
+		return errors.New(message)
 	}
 	return nil
 }
@@ -555,11 +583,25 @@ func (c *collector) result() protocol.Result {
 	return protocol.Result{ID: c.id, Model: c.model, Blocks: c.blocks, StopReason: c.stopReason, Usage: c.usage}
 }
 
+func (c *collector) finalize() (protocol.Result, error) {
+	if !c.terminal {
+		return protocol.Result{}, errors.New("Anthropic stream ended without message_stop")
+	}
+	if len(c.open) != 0 {
+		return protocol.Result{}, errors.New("Anthropic stream ended with open content blocks")
+	}
+	return c.result(), nil
+}
+
 func providerError(status int, header http.Header, raw []byte) error {
+	message := anthropicErrorMessage(raw)
+	if provider.IsContextWindowOverflow(message) {
+		return provider.ContextWindowOverflow(message, raw)
+	}
 	return &provider.HTTPError{
 		Status:     status,
 		Type:       "provider_error",
-		Message:    anthropicErrorMessage(raw),
+		Message:    message,
 		Body:       raw,
 		RetryAfter: retryAfter(header.Get("Retry-After")),
 	}

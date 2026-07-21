@@ -46,15 +46,18 @@ or credentials managed directly by vendor clients and provider CLIs.
 
 ## Other network traffic
 
-For the Claude Code child process, macaz disables the documented telemetry,
-error-reporting, feedback-command, and feedback-survey settings it controls.
+For the Claude Code child process, macaz requests do-not-track behavior and
+disables error reporting, the feedback command, and the feedback survey. It
+does not force `DISABLE_TELEMETRY` or
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: those umbrella settings also disable
+Claude Code feature-flag evaluation and can make client features unavailable.
 This does not guarantee that a third-party client makes no other network
-requests: client update checks, safety services, extensions, hooks, MCP servers,
-plugins, and other configured features may use the network independently. In
-particular, Claude Code may send a WebFetch hostname to Anthropic for a safety
-check even when model inference uses another provider. Codex behavior outside
-the routed inference request follows the user's Codex configuration and
-OpenAI's current documentation.
+requests: feature evaluation, client update checks, safety services,
+extensions, hooks, MCP servers, plugins, and other configured features may use
+the network independently. In particular, Claude Code may send a WebFetch
+hostname to Anthropic for a safety check even when model inference uses another
+provider. Codex behavior outside the routed inference request follows the
+user's Codex configuration and OpenAI's current documentation.
 
 Provider CLIs, Claude Code, Codex CLI, OpenCode, the installer, MCP servers, and
 GitHub may create their own local state or network logs under their respective

@@ -63,6 +63,9 @@ func TestCheckModelsAndGenerate(t *testing.T) {
 			if body["model"] != "test/tool-model" {
 				t.Fatalf("model = %#v", body["model"])
 			}
+			if body["session_id"] != "macaz_session_agent" {
+				t.Fatalf("session_id = %#v", body["session_id"])
+			}
 			if tools, _ := body["tools"].([]any); len(tools) != 1 {
 				t.Fatalf("tools = %#v", body["tools"])
 			}
@@ -105,8 +108,9 @@ func TestCheckModelsAndGenerate(t *testing.T) {
 		t.Fatalf("models = %#v", models)
 	}
 	result, err := upstream.Generate(context.Background(), &protocol.Request{
-		Model:     "sonnet",
-		MaxTokens: 100,
+		Model:          "sonnet",
+		MaxTokens:      100,
+		PromptCacheKey: "macaz_session_agent",
 		Messages: []protocol.Message{{
 			Role: "user",
 			Content: mustContent(t,
@@ -155,6 +159,40 @@ func TestProviderErrorPreservesRetryAfter(t *testing.T) {
 	}
 	if httpErr.RetryAfter != 7*time.Second {
 		t.Fatalf("retry after = %s", httpErr.RetryAfter)
+	}
+}
+
+func TestProviderErrorMapsContextOverflow(t *testing.T) {
+	err := providerError(http.StatusBadRequest, nil, []byte(`{"error":{"message":"maximum context length exceeded"}}`))
+	var httpErr *provider.HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if httpErr.Status != http.StatusRequestEntityTooLarge || httpErr.Type != "request_too_large" {
+		t.Fatalf("HTTP error = %#v", httpErr)
+	}
+}
+
+func TestGenerateRejectsTruncatedStream(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"m1\"}}\n\n")
+		fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"partial\"}\n\n")
+	}))
+	defer server.Close()
+
+	cfg := config.Default()
+	cfg.OpenRouterBaseURL = server.URL
+	cfg.OpenRouterModel = "test/tool-model"
+	upstream := New(cfg)
+	_, err := upstream.Generate(context.Background(), &protocol.Request{
+		Model:     "test/tool-model",
+		MaxTokens: 32,
+		Messages:  []protocol.Message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "without a terminal response event") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

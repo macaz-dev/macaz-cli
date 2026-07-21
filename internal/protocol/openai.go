@@ -287,10 +287,15 @@ func ToResponses(req *Request, model, defaultEffort string) (ResponsesRequest, e
 			if schema == nil {
 				schema = map[string]any{"type": "object", "properties": map[string]any{}}
 			}
+			description := tool.Description
+			if strings.EqualFold(tool.Name, "Read") {
+				description = readToolDescription(description)
+				schema = readToolSchema(schema)
+			}
 			tools = append(tools, map[string]any{
 				"type":        "function",
 				"name":        names.Provider(tool.Name),
-				"description": tool.Description,
+				"description": description,
 				"parameters":  schema,
 				"strict":      false,
 			})
@@ -320,6 +325,38 @@ func ToResponses(req *Request, model, defaultEffort string) (ResponsesRequest, e
 		}
 	}
 	return ResponsesRequest{Body: body, ToolNames: names}, nil
+}
+
+const readOffsetGuidance = "Codex Read guidance: offset is an optional zero-based continuation index. Use it only after a prior Read of the same file returned content and more lines are needed. Compute it as the prior offset plus returned line count; line numbers, byte counts, token counts, file sizes, and guessed positions are invalid offsets. Omit offset and limit when opening a file or when unsure."
+
+func readToolDescription(description string) string {
+	description = strings.TrimSpace(description)
+	if strings.Contains(description, "Codex Read guidance:") {
+		return description
+	}
+	if description == "" {
+		description = "Reads a file from the local filesystem."
+	}
+	return description + "\n\n" + readOffsetGuidance
+}
+
+func readToolSchema(schema map[string]any) map[string]any {
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		return schema
+	}
+	var cloned map[string]any
+	if json.Unmarshal(raw, &cloned) != nil {
+		return schema
+	}
+	properties, _ := cloned["properties"].(map[string]any)
+	if offset, ok := properties["offset"].(map[string]any); ok {
+		offset["description"] = "Optional continuation index after a prior Read; omit when opening a file or when unsure."
+	}
+	if limit, ok := properties["limit"].(map[string]any); ok {
+		limit["description"] = "Optional line count for a continuation Read; omit when opening a file."
+	}
+	return cloned
 }
 
 func responsesInput(messages []Message, names *ToolNames) ([]any, error) {
@@ -784,17 +821,104 @@ func extensionForMediaType(mediaType string) string {
 }
 
 func EstimateInputTokens(req *Request) int {
-	raw, _ := json.Marshal(req)
-	if len(raw) == 0 {
+	if req == nil {
 		return 1
 	}
-	// A deterministic UTF-8 byte heuristic used only when the provider has no
-	// token-count API. The caller labels this value as estimated.
-	count := (len(raw) + 3) / 4
+	// This remains an estimate, but count only model-visible content. Counting
+	// the entire wire JSON makes routing metadata and base64 image bytes look
+	// like prompt text and can trigger Claude Code compaction far too early.
+	characters := len(req.Model)
+	if system, err := SystemText(req.System); err == nil {
+		characters += len(system)
+	} else {
+		characters += len(req.System)
+	}
+	for _, message := range req.Messages {
+		characters += len(message.Role) + 4
+		blocks, err := DecodeBlocks(message.Content)
+		if err != nil {
+			characters += len(message.Content)
+			continue
+		}
+		characters += estimatedBlockCharacters(blocks)
+	}
+	for _, tool := range req.Tools {
+		characters += len(tool.Name) + len(tool.Description) + 16
+		if raw, err := json.Marshal(tool.InputSchema); err == nil {
+			characters += len(raw)
+		}
+	}
+	for _, stop := range req.StopSequences {
+		characters += len(stop)
+	}
+	count := (characters + 3) / 4
 	if count < 1 {
 		return 1
 	}
 	return count
+}
+
+func estimatedBlockCharacters(blocks []Block) int {
+	total := 0
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			total += len(block.Text)
+		case "thinking":
+			total += len(block.Thinking) + estimatedReasoningCharacters(block.Signature)
+		case "redacted_thinking":
+			total += estimatedReasoningCharacters(block.Signature)
+		case "tool_use":
+			total += len(block.ID) + len(block.Name) + len(block.Input) + 12
+		case "tool_result":
+			total += len(block.ToolUseID) + 8
+			children, err := DecodeBlocks(block.Content)
+			if err != nil {
+				total += len(block.Content)
+			} else {
+				total += estimatedBlockCharacters(children)
+			}
+		case "image":
+			// A fixed 2k-token allowance avoids treating base64 transport bytes as
+			// text while remaining conservative for typical Claude image inputs.
+			total += 8_000
+		case "document":
+			total += estimatedDocumentCharacters(block.Source)
+		default:
+			if len(block.Raw) > 0 {
+				total += len(block.Raw)
+			} else if raw, err := json.Marshal(block); err == nil {
+				total += len(raw)
+			}
+		}
+	}
+	return total
+}
+
+func estimatedReasoningCharacters(signature string) int {
+	// Encrypted reasoning is base64-like and includes a fixed envelope that is
+	// not model-visible. Match the conservative approximation used by the Codex
+	// reference proxy instead of charging every encoded byte as prompt text.
+	visible := len(signature)*3/4 - 650
+	if visible < 0 {
+		return 0
+	}
+	return visible
+}
+
+func estimatedDocumentCharacters(source *Source) int {
+	if source == nil {
+		return 0
+	}
+	if source.Type == "base64" {
+		if decoded, err := base64.StdEncoding.DecodeString(source.Data); err == nil {
+			return len(decoded)
+		}
+		return len(source.Data) * 3 / 4
+	}
+	// URL-backed documents have unknown size until fetched. Use the same
+	// conservative allowance as an image rather than counting only the URL.
+	return 8_000
 }
 
 func DecodeBase64(data string) ([]byte, error) {

@@ -204,6 +204,7 @@ func (p *Provider) acquireServer(ctx context.Context) (*appServer, func(bool), e
 }
 
 func (p *Provider) Close() error {
+	p.closePending()
 	p.poolMu.Lock()
 	if p.closed {
 		p.poolMu.Unlock()

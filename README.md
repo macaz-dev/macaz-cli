@@ -188,7 +188,10 @@ The isolated profiles may contain client-owned session history. See
 
 ## Provider notes
 
-- OpenAI API and OpenRouter use Responses-compatible HTTP adapters.
+- OpenAI API and OpenRouter use Responses-compatible HTTP adapters. They reject
+  truncated streams and invalid tool arguments instead of returning partial
+  success. OpenRouter also receives a per-session/per-agent sticky routing key
+  without changing the selected model.
 - OpenAI Subscription uses device authorization, refreshes credentials, and
   applies bounded account retry/backoff. It is experimental and remains
   subject to OpenAI's current account terms.
@@ -197,13 +200,22 @@ The isolated profiles may contain client-owned session history. See
   Anthropic tools with a typed raw-input wrapper and converted back before
   Codex executes them.
 - Codex CLI as a provider uses `codex app-server` and is offered only to the
-  Claude client; using Codex as both client and upstream would recurse.
+  Claude client; using Codex as both client and upstream would recurse. Client
+  tool calls remain on the same app-server thread: Claude executes the tool and
+  macaz returns its structured result to the pending JSON-RPC call. Pending
+  turns are isolated by Claude session and agent and expire after five minutes.
 - OpenCode CLI uses an isolated request-scoped provider configuration. Its
   project tools and context are not exposed as a second agent layer.
 - Claude Code controls skill and subagent fan-out. Parallel subagents and Auto
   mode classifier checks can consume substantially more provider usage than a
-  single-agent Codex session; macaz preserves that client behavior and does not
-  impose a non-standard cross-session limit.
+  single-agent Codex session. Macaz keeps the user's selected model for main,
+  background, and subagent work, while OpenAI Subscription fan-out is bounded
+  to four concurrent upstream requests by default. Advanced users can change
+  `max_concurrent_subscription_requests` in `config.json`.
+- Macaz keeps the exact selected model for main, background, classifier, and
+  subagent paths. It sets Claude's automatic compact window only when the active
+  provider reports a context limit, and caps reasoning effort only for Claude's
+  dedicated conversation-compaction request.
 
 ## Local development
 

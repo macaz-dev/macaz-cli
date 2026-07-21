@@ -10,6 +10,7 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -58,7 +59,8 @@ func runFakeOpenCode() int {
 {
   "name": "Fake Default",
   "variants": {"low": {}, "high": {}},
-  "capabilities": {"input": {"image": true, "pdf": true}}
+  "capabilities": {"input": {"image": true, "pdf": true}},
+  "limit": {"context": 200000, "output": 32000}
 }
 fake/next
 {
@@ -362,6 +364,37 @@ func TestOpenCodeEventErrorPreservesProviderFailure(t *testing.T) {
 	}
 }
 
+func TestOpenCodeEventErrorMapsContextOverflow(t *testing.T) {
+	err := openCodeEventError(
+		"APIError",
+		"maximum context length exceeded",
+		http.StatusBadRequest,
+		false,
+		nil,
+	)
+	var httpErr *provider.HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error type = %T", err)
+	}
+	if httpErr.Status != http.StatusRequestEntityTooLarge || httpErr.Type != "request_too_large" {
+		t.Fatalf("error = %#v", httpErr)
+	}
+}
+
+func TestIdleCancellerCancelsStalledOpenCodeProcess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	watchdog := newIdleCanceller(cancel, 5*time.Millisecond)
+	defer watchdog.stop()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("idle watchdog did not cancel the process context")
+	}
+	if !watchdog.expired() {
+		t.Fatal("idle watchdog did not record the timeout")
+	}
+}
+
 func TestProviderDiscoversModelsFromLocalCLI(t *testing.T) {
 	t.Setenv("MACAZ_FAKE_OPENCODE", "1")
 	cfg := config.Default()
@@ -387,6 +420,9 @@ func TestProviderDiscoversModelsFromLocalCLI(t *testing.T) {
 	}
 	if got := strings.Join(models[0].InputModalities, ","); got != "text,image,pdf" {
 		t.Fatalf("modalities = %q", got)
+	}
+	if models[0].ContextWindow != 200000 || models[0].MaxOutputTokens != 32000 || !models[0].ToolCall || !models[0].Attachment {
+		t.Fatalf("model capabilities = %#v", models[0])
 	}
 }
 

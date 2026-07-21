@@ -3,14 +3,17 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/macaz-dev/macaz-cli/internal/config"
 	"github.com/macaz-dev/macaz-cli/internal/protocol"
+	providerpkg "github.com/macaz-dev/macaz-cli/internal/provider"
 )
 
 func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
@@ -93,6 +96,60 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 	count, estimated, err := provider.CountTokens(context.Background(), request)
 	if err != nil || count != 17 || estimated {
 		t.Fatalf("count = %d, estimated = %t, error = %v", count, estimated, err)
+	}
+}
+
+func TestGenerateRejectsTruncatedAndInvalidToolStreams(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "missing message stop",
+			body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\",\"model\":\"claude-test\",\"usage\":{}}}\n\n",
+			want: "without message_stop",
+		},
+		{
+			name: "invalid tool arguments",
+			body: "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"Read\",\"input\":{}}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}\n\n" +
+				"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+			want: "invalid or empty JSON arguments",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("ANTHROPIC_API_KEY", "anthropic-test-key")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			cfg := config.Default()
+			cfg.AnthropicBaseURL = server.URL
+			cfg.AnthropicModel = "claude-test"
+			upstream := New(cfg)
+			_, err := upstream.Generate(context.Background(), &protocol.Request{
+				Model:     "claude-test",
+				MaxTokens: 32,
+				Messages:  []protocol.Message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+				Tools:     []protocol.Tool{{Name: "Read", InputSchema: map[string]any{"type": "object"}}},
+			}, nil)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestProviderErrorMapsContextOverflow(t *testing.T) {
+	err := providerError(http.StatusBadRequest, nil, []byte(`{"error":{"message":"maximum context length exceeded"}}`))
+	var httpErr *providerpkg.HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if httpErr.Status != http.StatusRequestEntityTooLarge || httpErr.Type != "request_too_large" {
+		t.Fatalf("HTTP error = %#v", httpErr)
 	}
 }
 

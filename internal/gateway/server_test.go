@@ -131,6 +131,16 @@ func TestMessagesAndCountTokens(t *testing.T) {
 	}
 }
 
+func TestContextOverflowUsesAnthropicRequestTooLargeType(t *testing.T) {
+	err := provider.ContextWindowOverflow("context window exceeded", nil)
+	if providerErrorType(err) != "request_too_large" {
+		t.Fatalf("error type = %q", providerErrorType(err))
+	}
+	if provider.Status(err) != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d", provider.Status(err))
+	}
+}
+
 func TestClaudeSessionRoutingIsStableAndAgentIsolated(t *testing.T) {
 	server := &Server{client: config.ClientClaude}
 	request := func(agent string) *protocol.Request {

@@ -150,6 +150,20 @@ func TestEffort(t *testing.T) {
 	}
 }
 
+func TestCompactionEffortIsCappedAtLow(t *testing.T) {
+	req := &Request{
+		System:       json.RawMessage(`"You are a helpful AI assistant tasked with summarizing conversations."`),
+		OutputConfig: json.RawMessage(`{"effort":"max"}`),
+	}
+	if got := Effort(req, "high"); got != "low" {
+		t.Fatalf("compaction effort = %q", got)
+	}
+	req.OutputConfig = json.RawMessage(`{"effort":"minimal"}`)
+	if got := Effort(req, "high"); got != "minimal" {
+		t.Fatalf("low explicit compaction effort was raised to %q", got)
+	}
+}
+
 func TestToolChoiceFiltersToolsAndDisablesParallelCalls(t *testing.T) {
 	req := &Request{
 		Messages: []Message{{Role: "user", Content: json.RawMessage(`"use a tool"`)}},
@@ -177,6 +191,38 @@ func TestToolChoiceFiltersToolsAndDisablesParallelCalls(t *testing.T) {
 	choice := translated.Body["tool_choice"].(map[string]any)
 	if choice["name"] != "Read" {
 		t.Fatalf("tool_choice = %#v", choice)
+	}
+}
+
+func TestReadToolAddsOffsetGuidanceWithoutMutatingClientSchema(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"file_path": map[string]any{"type": "string"},
+			"offset":    map[string]any{"type": "integer", "description": "old"},
+			"limit":     map[string]any{"type": "integer"},
+		},
+	}
+	req := &Request{
+		Messages: []Message{{Role: "user", Content: json.RawMessage(`"read"`)}},
+		Tools:    []Tool{{Name: "Read", Description: "Read a file", InputSchema: schema}},
+	}
+	translated, err := ToResponses(req, "gpt-test", "medium")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := translated.Body["tools"].([]map[string]any)[0]
+	if !strings.Contains(tool["description"].(string), "Codex Read guidance") {
+		t.Fatalf("description = %q", tool["description"])
+	}
+	parameters := tool["parameters"].(map[string]any)
+	properties := parameters["properties"].(map[string]any)
+	if !strings.Contains(properties["offset"].(map[string]any)["description"].(string), "continuation") {
+		t.Fatalf("offset schema = %#v", properties["offset"])
+	}
+	original := schema["properties"].(map[string]any)["offset"].(map[string]any)["description"]
+	if original != "old" {
+		t.Fatalf("client schema was mutated: %#v", schema)
 	}
 }
 
@@ -247,5 +293,44 @@ func TestResponsesPreservesSessionCacheTierAndOpenAIReasoning(t *testing.T) {
 	reasoning := input[0].(map[string]any)
 	if reasoning["type"] != "reasoning" || reasoning["encrypted_content"] != signature {
 		t.Fatalf("reasoning = %#v", reasoning)
+	}
+}
+
+func TestEstimateInputTokensCountsModelVisibleContentNotMetadata(t *testing.T) {
+	short := &Request{
+		Model:    "gpt-test",
+		Messages: []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+		Metadata: map[string]any{"diagnostic": strings.Repeat("x", 1<<20)},
+	}
+	withoutMetadata := *short
+	withoutMetadata.Metadata = nil
+	if got, want := EstimateInputTokens(short), EstimateInputTokens(&withoutMetadata); got != want {
+		t.Fatalf("metadata changed estimate: got %d, want %d", got, want)
+	}
+	longer := withoutMetadata
+	longer.Messages = []Message{{Role: "user", Content: json.RawMessage(strconv.Quote(strings.Repeat("visible prompt ", 1000)))}}
+	if EstimateInputTokens(&longer) <= EstimateInputTokens(&withoutMetadata) {
+		t.Fatal("visible prompt growth did not increase the estimate")
+	}
+}
+
+func TestEstimateInputTokensDoesNotCountImageBase64AsText(t *testing.T) {
+	content, err := json.Marshal([]Block{{
+		Type: "image",
+		Source: &Source{
+			Type:      "base64",
+			MediaType: "image/png",
+			Data:      base64.StdEncoding.EncodeToString(make([]byte, 1<<20)),
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := EstimateInputTokens(&Request{
+		Model:    "gpt-test",
+		Messages: []Message{{Role: "user", Content: content}},
+	})
+	if count < 1_500 || count > 3_000 {
+		t.Fatalf("image estimate = %d, want a bounded vision allowance", count)
 	}
 }
