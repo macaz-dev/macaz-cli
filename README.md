@@ -203,13 +203,22 @@ The isolated profiles may contain client-owned session history. See
   `/v1/messages/count_tokens`. Responses custom tools are converted to normal
   Anthropic tools with a typed raw-input wrapper and converted back before
   Codex executes them.
-- Codex CLI as a provider uses `codex app-server` and is offered only to the
-  Claude client; using Codex as both client and upstream would recurse. Client
-  tool calls remain on the same app-server thread: Claude executes the tool and
-  macaz returns its structured result to the pending JSON-RPC call. Pending
-  turns are isolated by Claude session and agent and expire after five minutes.
-  Macaz reserves one CLI slot for new traffic; excess pending turns use the
-  safe interrupted-turn fallback instead of starving the pool.
+- Codex CLI as a provider uses `codex app-server` only as the authenticated
+  transport and is offered only to the Claude client; using Codex as both
+  client and upstream would recurse. Macaz derives a private temporary model
+  catalog from Codex's local model caches, including the default profile,
+  `CODEX_HOME`, sibling profiles, and profiles reported by wrapper executables.
+  Malformed cache revisions are skipped when another valid profile is
+  available; `MACAZ_CODEX_MODEL_CATALOG` can explicitly select a fully custom
+  catalog path. Macaz normalizes supported Codex catalog schema revisions,
+  selects direct tool calling, disables Codex execution environments, and
+  leaves every source cache unchanged. Claude
+  executes client tools and macaz returns each structured result to the same
+  app-server thread. Pending turns are isolated by Claude session and agent and
+  expire after five minutes. Macaz reserves one CLI slot for new traffic;
+  excess pending turns use the safe interrupted-turn fallback instead of
+  starving the pool. If the Codex model cache is missing, run Codex once before
+  using this experimental bridge.
 - OpenCode CLI uses an isolated request-scoped provider configuration. Its
   project tools and context are not exposed as a second agent layer.
 - Claude Code controls skill and subagent fan-out. Parallel subagents and Auto

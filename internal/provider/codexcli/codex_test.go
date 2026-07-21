@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -39,7 +40,19 @@ func TestMain(m *testing.M) {
 	if os.Getenv("MACAZ_FAKE_CODEX") == "1" {
 		os.Exit(runFakeCodex())
 	}
-	os.Exit(m.Run())
+	var fixtureDir string
+	if strings.TrimSpace(os.Getenv("MACAZ_CODEX_INTEGRATION_EXECUTABLE")) == "" &&
+		strings.TrimSpace(os.Getenv(codexModelCatalogOverride)) == "" {
+		fixtureDir, _ = os.MkdirTemp("", "macaz-codex-test-catalog-*")
+		fixture := filepath.Join(fixtureDir, "models_cache.json")
+		_ = os.WriteFile(fixture, []byte(`{"models":[{"slug":"fake-default","display_name":"Fake Default"},{"slug":"fake-next","display_name":"Fake Next"}]}`), 0o600)
+		_ = os.Setenv(codexModelCatalogOverride, fixture)
+	}
+	code := m.Run()
+	if fixtureDir != "" {
+		_ = os.RemoveAll(fixtureDir)
+	}
+	os.Exit(code)
 }
 
 func TestProviderNameMarksCLIExperimental(t *testing.T) {
@@ -152,6 +165,23 @@ func runFakeCodex() int {
 					},
 				},
 			})
+			if os.Getenv("MACAZ_FAKE_CODEX_REASONING") == "1" {
+				_ = encoder.Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "item/reasoning/summaryTextDelta",
+					"params": map[string]any{
+						"itemId": "reasoning-fake",
+						"delta":  "Inspecting the request",
+					},
+				})
+				_ = encoder.Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "item/completed",
+					"params": map[string]any{"item": map[string]any{
+						"id": "reasoning-fake", "type": "reasoning",
+					}},
+				})
+			}
 			_ = encoder.Encode(map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "item/agentMessage/delta",
@@ -186,6 +216,19 @@ func runFakeCodex() int {
 				toolCall["id"] = "tool-request-fake"
 			}
 			_ = encoder.Encode(toolCall)
+			if os.Getenv("MACAZ_FAKE_CODEX_PARALLEL_TOOLS") == "1" {
+				_ = encoder.Encode(map[string]any{
+					"jsonrpc": "2.0",
+					"method":  "item/tool/call",
+					"params": map[string]any{
+						"callId":    "call-fake-second",
+						"threadId":  "thread-fake",
+						"turnId":    "turn-fake",
+						"tool":      "List",
+						"arguments": map[string]any{"path": "."},
+					},
+				})
+			}
 		case "turn/interrupt":
 			_ = encoder.Encode(map[string]any{
 				"jsonrpc": "2.0",
@@ -236,6 +279,7 @@ func TestNativeToolDetection(t *testing.T) {
 		"commandExecution",
 		"fileChange",
 		"mcpToolCall",
+		"plan",
 		"webSearch",
 		"imageView",
 		"subAgentActivity",
@@ -245,7 +289,7 @@ func TestNativeToolDetection(t *testing.T) {
 			t.Fatalf("%q should be forbidden", item)
 		}
 	}
-	for _, item := range []string{"", "userMessage", "agentMessage", "reasoning", "plan", "dynamicToolCall"} {
+	for _, item := range []string{"", "userMessage", "agentMessage", "reasoning", "dynamicToolCall"} {
 		if isNativeTool(item) {
 			t.Fatalf("%q must be allowed", item)
 		}
@@ -326,6 +370,7 @@ func TestAppServerArgsDisableProviderContextAndNativeTools(t *testing.T) {
 		`include_environment_context=false`,
 		`mcp_servers={}`,
 		`web_search="disabled"`,
+		`tools.experimental_request_user_input.enabled=false`,
 		"shell_tool",
 		"unified_exec",
 		"browser_use",
@@ -336,13 +381,161 @@ func TestAppServerArgsDisableProviderContextAndNativeTools(t *testing.T) {
 	}
 }
 
-func TestThreadParamsUseFullPermissions(t *testing.T) {
+func TestPrepareDirectModelCatalogOverridesAgentRuntimeSelectors(t *testing.T) {
+	sourceDir := t.TempDir()
+	source := filepath.Join(sourceDir, "models_cache.json")
+	raw := []byte(`{"etag":"fixture","models":[{"slug":"gpt-test","tool_mode":"code_mode_only","multi_agent_version":"v2","display_name":"GPT Test","supports_reasoning_summary_parameter":false},{"slug":"gpt-new","display_name":"GPT New"}]}`)
+	if err := os.WriteFile(source, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(codexModelCatalogOverride, source)
+
+	path, err := prepareDirectModelCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(output, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 2 || catalog.Models[0]["tool_mode"] != "direct" ||
+		catalog.Models[0]["multi_agent_version"] != nil || catalog.Models[0]["display_name"] != "GPT Test" {
+		t.Fatalf("direct catalog = %#v", catalog.Models)
+	}
+	if catalog.Models[0]["supports_reasoning_summaries"] != false ||
+		catalog.Models[1]["supports_reasoning_summaries"] != true {
+		t.Fatalf("reasoning-summary compatibility = %#v", catalog.Models)
+	}
+	unchanged, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(unchanged, []byte(`"tool_mode":"code_mode_only"`)) {
+		t.Fatalf("source catalog was modified: %s", unchanged)
+	}
+	if joined := strings.Join(appServerArgsWithCatalog(path), "\n"); !strings.Contains(joined, "model_catalog_json=") || !strings.Contains(joined, path) {
+		t.Fatalf("catalog override args = %s", joined)
+	}
+}
+
+func TestCodexHomeFromVersionOutput(t *testing.T) {
+	output := []byte("Using work profile\nCODEX_HOME=/tmp/codex-work\ncodex-cli 0.144.6\n")
+	if got := codexHomeFromVersionOutput(output); got != "/tmp/codex-work" {
+		t.Fatalf("reported CODEX_HOME = %q", got)
+	}
+	if got := codexHomeFromVersionOutput([]byte("CODEX_HOME=relative/path\n")); got != "" {
+		t.Fatalf("relative CODEX_HOME must be ignored, got %q", got)
+	}
+}
+
+func TestLoadDirectModelCatalogSkipsBrokenSiblingProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv(codexModelCatalogOverride, "")
+	resolvedHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedHome != home {
+		t.Skipf("platform does not resolve UserHomeDir from HOME: %q", resolvedHome)
+	}
+
+	defaultDir := filepath.Join(home, ".codex")
+	workDir := filepath.Join(home, ".codex-work")
+	if err := os.MkdirAll(defaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultDir, "models_cache.json"), []byte(`{"models":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workDir, "models_cache.json"), []byte(`{"models":[{"slug":"gpt-profile","display_name":"Profile Model"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := loadDirectModelCatalog("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var catalog struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Models) != 1 || catalog.Models[0]["slug"] != "gpt-profile" ||
+		catalog.Models[0]["tool_mode"] != "direct" ||
+		catalog.Models[0]["supports_reasoning_summaries"] != true {
+		t.Fatalf("discovered profile catalog = %#v", catalog.Models)
+	}
+}
+
+func TestProviderPinsValidatedDirectCatalogAcrossAppServers(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "models_cache.json")
+	if err := os.WriteFile(source, []byte(`{"models":[{"slug":"gpt-test","tool_mode":"code_mode_only","display_name":"GPT Test"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(codexModelCatalogOverride, source)
+	t.Setenv("MACAZ_FAKE_CODEX", "1")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upstream := New(config.Default())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	first, err := upstream.startAppServer(ctx, executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	// Simulate Codex refreshing its cache between the main Claude turn and an
+	// Auto Mode permission-classifier request. The second server must use the
+	// already validated snapshot instead of rereading the changing source.
+	if err := os.WriteFile(source, []byte(`{"models":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := upstream.startAppServer(ctx, executable)
+	if err != nil {
+		t.Fatalf("second app-server reread the changing source catalog: %v", err)
+	}
+	defer second.Close()
+
+	firstCatalog, err := os.ReadFile(filepath.Join(first.baseDir, "models-direct.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCatalog, err := os.ReadFile(filepath.Join(second.baseDir, "models-direct.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(firstCatalog, secondCatalog) {
+		t.Fatalf("app-servers received different direct catalogs")
+	}
+}
+
+func TestThreadParamsDisableProviderExecution(t *testing.T) {
 	params := threadStartParams("gpt-test", "/tmp/request", "client system", nil)
 	if params["approvalPolicy"] != "never" {
 		t.Fatalf("approvalPolicy = %#v", params["approvalPolicy"])
 	}
-	if params["sandbox"] != "danger-full-access" {
-		t.Fatalf("sandbox = %#v, want danger-full-access", params["sandbox"])
+	if params["sandbox"] != "read-only" {
+		t.Fatalf("sandbox = %#v, want read-only", params["sandbox"])
+	}
+	environments, ok := params["environments"].([]any)
+	if !ok || len(environments) != 0 {
+		t.Fatalf("environments = %#v, want disabled", params["environments"])
 	}
 }
 
@@ -393,10 +586,11 @@ func TestCodexInputsPreserveImagesAndDocuments(t *testing.T) {
 	}
 }
 
-func TestProviderUsesClientContextDynamicToolsAndFullPermissions(t *testing.T) {
+func TestProviderUsesClientContextDynamicToolsWithoutProviderExecution(t *testing.T) {
 	reportPath := filepath.Join(t.TempDir(), "report.json")
 	t.Setenv("MACAZ_FAKE_CODEX", "1")
 	t.Setenv("MACAZ_FAKE_CODEX_REPORT", reportPath)
+	t.Setenv("MACAZ_FAKE_CODEX_REASONING", "1")
 
 	cfg := config.Default()
 	cfg.Provider = config.ProviderCodexCLI
@@ -426,8 +620,10 @@ func TestProviderUsesClientContextDynamicToolsAndFullPermissions(t *testing.T) {
 	if result.Model != "fake-next" || result.StopReason != "tool_use" {
 		t.Fatalf("result = %#v", result)
 	}
-	if len(result.Blocks) != 2 || result.Blocks[0].Text != "checking " ||
-		result.Blocks[1].Type != "tool_use" || result.Blocks[1].Name != "Read" {
+	if len(result.Blocks) != 3 || result.Blocks[0].Type != "thinking" ||
+		result.Blocks[0].Thinking != "Inspecting the request" ||
+		result.Blocks[1].Text != "checking " ||
+		result.Blocks[2].Type != "tool_use" || result.Blocks[2].Name != "Read" {
 		t.Fatalf("blocks = %#v", result.Blocks)
 	}
 	if result.Usage.InputTokens != 31 || result.Usage.OutputTokens != 7 ||
@@ -445,12 +641,15 @@ func TestProviderUsesClientContextDynamicToolsAndFullPermissions(t *testing.T) {
 	}
 	if report.ThreadParams["model"] != "fake-next" ||
 		report.ThreadParams["baseInstructions"] != "CLIENT SYSTEM ONLY" ||
-		report.ThreadParams["developerInstructions"] != "" ||
+		report.ThreadParams["developerInstructions"] != bridgeInstructions ||
 		report.ThreadParams["approvalPolicy"] != "never" ||
-		report.ThreadParams["sandbox"] != "danger-full-access" ||
+		report.ThreadParams["sandbox"] != "read-only" ||
 		report.ThreadParams["ephemeral"] != true ||
 		report.ThreadParams["allowProviderModelFallback"] != false {
 		t.Fatalf("thread params = %#v", report.ThreadParams)
+	}
+	if environments, ok := report.ThreadParams["environments"].([]any); !ok || len(environments) != 0 {
+		t.Fatalf("thread environments = %#v", report.ThreadParams["environments"])
 	}
 	if report.CWD == "" || !strings.Contains(filepath.Base(report.CWD), "macaz-codex-") ||
 		report.PWD != report.CWD {
@@ -464,7 +663,7 @@ func TestProviderUsesClientContextDynamicToolsAndFullPermissions(t *testing.T) {
 	if selected["name"] != "Read" {
 		t.Fatalf("selected dynamic tool = %#v", selected)
 	}
-	if report.TurnParams["effort"] != "high" {
+	if report.TurnParams["effort"] != "high" || report.TurnParams["summary"] != "auto" {
 		t.Fatalf("turn params = %#v", report.TurnParams)
 	}
 	input, _ := report.TurnParams["input"].([]any)
@@ -536,6 +735,9 @@ func TestProviderMapsContextOverflowAndCapsCompactionEffort(t *testing.T) {
 	}
 	if report.TurnParams["effort"] != "low" {
 		t.Fatalf("compaction turn params = %#v", report.TurnParams)
+	}
+	if _, ok := report.TurnParams["summary"]; ok {
+		t.Fatalf("compaction should not request a reasoning summary: %#v", report.TurnParams)
 	}
 }
 
@@ -651,6 +853,34 @@ func TestProviderContinuesPendingDynamicToolOnSameThread(t *testing.T) {
 	}
 	if report.ThreadStarts != 1 || report.TurnStarts != 1 || report.ToolResults != 1 {
 		t.Fatalf("structured handoff report = %#v", report)
+	}
+}
+
+func TestProviderBatchesParallelDirectToolCalls(t *testing.T) {
+	t.Setenv("MACAZ_FAKE_CODEX", "1")
+	t.Setenv("MACAZ_FAKE_CODEX_PARALLEL_TOOLS", "1")
+
+	cfg := config.Default()
+	cfg.Provider = config.ProviderCodexCLI
+	cfg.CodexExecutable = os.Args[0]
+	upstream := New(cfg)
+	defer upstream.Close()
+
+	result, err := upstream.Generate(context.Background(), &protocol.Request{
+		Model:    "fake-default",
+		Messages: []protocol.Message{{Role: "user", Content: json.RawMessage(`"inspect"`)}},
+		Tools: []protocol.Tool{
+			{Name: "Read", InputSchema: map[string]any{"type": "object"}},
+			{Name: "List", InputSchema: map[string]any{"type": "object"}},
+		},
+		ToolChoice: json.RawMessage(`{"type":"auto","disable_parallel_tool_use":false}`),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StopReason != "tool_use" || len(result.Blocks) != 3 ||
+		result.Blocks[1].Name != "Read" || result.Blocks[2].Name != "List" {
+		t.Fatalf("parallel result = %#v", result)
 	}
 }
 
@@ -1008,6 +1238,79 @@ func TestLiveCodexIntegration(t *testing.T) {
 		t.Fatalf("expected Read tool call for README.md, result = %#v", result)
 	})
 
+	t.Run("tool-continuation", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		tools := []protocol.Tool{{
+			Name:        "LookupFixture",
+			Description: "Return the requested fixture value",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{"type": "string"},
+				},
+				"required": []any{"name"},
+			},
+		}}
+		key := "macaz-live-tool-continuation"
+		firstRequest := &protocol.Request{
+			Model:          selected,
+			PromptCacheKey: key,
+			System:         json.RawMessage(`"Call the client tool exactly once, then use its result to reply with exactly MACAZ_TOOL_CONTINUATION_OK."`),
+			Messages: []protocol.Message{{
+				Role:    "user",
+				Content: json.RawMessage(`"Look up the verification fixture."`),
+			}},
+			Tools: tools,
+		}
+		firstResult, err := upstream.Generate(ctx, firstRequest, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if firstResult.StopReason != "tool_use" {
+			t.Fatalf("first result = %#v", firstResult)
+		}
+		var callID string
+		for _, block := range firstResult.Blocks {
+			if block.Type == "tool_use" && block.Name == "LookupFixture" {
+				callID = block.ID
+				break
+			}
+		}
+		if callID == "" {
+			t.Fatalf("missing direct LookupFixture call: %#v", firstResult)
+		}
+		assistantContent, err := json.Marshal(firstResult.Blocks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		toolResult, err := json.Marshal([]any{map[string]any{
+			"type":        "tool_result",
+			"tool_use_id": callID,
+			"content":     "MACAZ_TOOL_CONTINUATION_OK",
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondResult, err := upstream.Generate(ctx, &protocol.Request{
+			Model:          selected,
+			PromptCacheKey: key,
+			System:         firstRequest.System,
+			Messages: []protocol.Message{
+				firstRequest.Messages[0],
+				{Role: "assistant", Content: assistantContent},
+				{Role: "user", Content: toolResult},
+			},
+			Tools: tools,
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if secondResult.StopReason != "end_turn" || !strings.Contains(resultText(secondResult), "MACAZ_TOOL_CONTINUATION_OK") {
+			t.Fatalf("continued result = %#v", secondResult)
+		}
+	})
+
 	t.Run("document", func(t *testing.T) {
 		document := base64.StdEncoding.EncodeToString([]byte(
 			"The exact verification token in this document is MACAZ_DOCUMENT_OK.\n",
@@ -1085,6 +1388,149 @@ func TestLiveCodexIntegration(t *testing.T) {
 				t.Fatalf("image response = %q, result = %#v", text, result)
 			}
 		})
+	}
+}
+
+func TestLiveCodexDirectToolCalls(t *testing.T) {
+	executable := strings.TrimSpace(os.Getenv("MACAZ_CODEX_INTEGRATION_EXECUTABLE"))
+	if executable == "" {
+		t.Skip("set MACAZ_CODEX_INTEGRATION_EXECUTABLE to run against an authenticated local Codex CLI")
+	}
+	selected := strings.TrimSpace(os.Getenv("MACAZ_CODEX_INTEGRATION_MODEL"))
+	if selected == "" {
+		t.Skip("set MACAZ_CODEX_INTEGRATION_MODEL to a live Codex model")
+	}
+
+	cfg := config.Default()
+	cfg.Provider = config.ProviderCodexCLI
+	cfg.CodexExecutable = executable
+	for _, alias := range []string{"default", "opus", "sonnet", "haiku"} {
+		cfg.ModelMap[alias] = selected
+	}
+	upstream := New(cfg)
+	defer upstream.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	started := time.Now()
+	result, err := upstream.Generate(ctx, &protocol.Request{
+		Model:  selected,
+		Stream: true,
+		System: json.RawMessage(`"You are an inference provider. Call both client tools exactly once and in parallel. Do not use native tools. Do not answer with text."`),
+		Messages: []protocol.Message{{
+			Role:    "user",
+			Content: json.RawMessage(`"Call LookupAlpha with value alpha and LookupBeta with value beta in the same response."`),
+		}},
+		Tools: []protocol.Tool{
+			{
+				Name:        "LookupAlpha",
+				Description: "Return the alpha fixture. This tool must be called once.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"value": map[string]any{"type": "string"},
+					},
+					"required": []any{"value"},
+				},
+			},
+			{
+				Name:        "LookupBeta",
+				Description: "Return the beta fixture. This tool must be called once.",
+				InputSchema: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"value": map[string]any{"type": "string"},
+					},
+					"required": []any{"value"},
+				},
+			},
+		},
+		ToolChoice:   json.RawMessage(`{"type":"any","disable_parallel_tool_use":false}`),
+		OutputConfig: json.RawMessage(`{"effort":"low"}`),
+	}, func(event protocol.Event) error {
+		t.Logf("%s event kind=%d index=%d type=%s name=%s delta_type=%s", time.Since(started).Round(time.Millisecond), event.Kind, event.Index, event.Block.Type, event.Block.Name, event.DeltaType)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%s result blocks=%d", time.Since(started).Round(time.Millisecond), len(result.Blocks))
+	upstream.poolMu.Lock()
+	for server := range upstream.servers {
+		t.Logf("app-server stderr:\n%s", server.stderr.String())
+	}
+	upstream.poolMu.Unlock()
+	if result.StopReason != "tool_use" {
+		t.Fatalf("stop reason = %q, result = %#v", result.StopReason, result)
+	}
+	seen := make(map[string]bool)
+	toolCalls := 0
+	for _, block := range result.Blocks {
+		if block.Type == "tool_use" {
+			toolCalls++
+			if strings.HasPrefix(block.ID, "exec-") {
+				t.Fatalf("Codex exposed a nested code-mode call instead of a direct client tool: %#v", block)
+			}
+			seen[block.Name] = true
+		}
+	}
+	if toolCalls == 0 || (!seen["LookupAlpha"] && !seen["LookupBeta"]) {
+		t.Fatalf("expected at least one direct client tool call: %#v", result.Blocks)
+	}
+	if !seen["LookupAlpha"] || !seen["LookupBeta"] {
+		t.Logf("model chose a sequential tool plan; provider returned the direct call without a nested exec: %#v", result.Blocks)
+	}
+}
+
+func TestLiveCodexConcurrentServerStartup(t *testing.T) {
+	executable := strings.TrimSpace(os.Getenv("MACAZ_CODEX_INTEGRATION_EXECUTABLE"))
+	if executable == "" {
+		t.Skip("set MACAZ_CODEX_INTEGRATION_EXECUTABLE to run against an authenticated local Codex CLI")
+	}
+	selected := strings.TrimSpace(os.Getenv("MACAZ_CODEX_INTEGRATION_MODEL"))
+	if selected == "" {
+		t.Skip("set MACAZ_CODEX_INTEGRATION_MODEL to a live Codex model")
+	}
+
+	cfg := config.Default()
+	cfg.Provider = config.ProviderCodexCLI
+	cfg.CodexExecutable = executable
+	cfg.MaxConcurrentCLI = 4
+	for _, alias := range []string{"default", "opus", "sonnet", "haiku"} {
+		cfg.ModelMap[alias] = selected
+	}
+	upstream := New(cfg)
+	defer upstream.Close()
+
+	start := make(chan struct{})
+	results := make(chan error, cfg.MaxConcurrentCLI)
+	for index := 0; index < cfg.MaxConcurrentCLI; index++ {
+		index := index
+		go func() {
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			result, err := upstream.Generate(ctx, &protocol.Request{
+				Model:          selected,
+				PromptCacheKey: fmt.Sprintf("macaz-live-concurrent-%d", index),
+				System:         json.RawMessage(`"Reply with exactly PONG."`),
+				Messages: []protocol.Message{{
+					Role:    "user",
+					Content: json.RawMessage(`"ping"`),
+				}},
+				OutputConfig: json.RawMessage(`{"effort":"low"}`),
+			}, nil)
+			if err == nil && strings.TrimSpace(resultText(result)) == "" {
+				err = fmt.Errorf("worker %d returned no text: %#v", index, result)
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	for index := 0; index < cfg.MaxConcurrentCLI; index++ {
+		if err := <-results; err != nil {
+			t.Errorf("concurrent app-server startup failed: %v", err)
+		}
 	}
 }
 

@@ -25,6 +25,7 @@ const (
 	parallelToolGrace   = 300 * time.Millisecond
 	requestPhaseTimeout = 60 * time.Second
 	eventIdleTimeout    = 5 * time.Minute
+	bridgeInstructions  = "Macaz is using Codex only as the inference backend for Claude Code. Use only client-provided tools; the client executes them. Never call built-in provider tools or perform shell, file, browser, app, skill, planning, or subagent work inside Codex."
 )
 
 type Provider struct {
@@ -32,6 +33,8 @@ type Provider struct {
 	modelMu        sync.Mutex
 	models         []provider.Model
 	modelsAt       time.Time
+	catalogMu      sync.Mutex
+	directCatalog  []byte
 	poolMu         sync.Mutex
 	slots          chan struct{}
 	parkedSlots    chan struct{}
@@ -293,10 +296,14 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 			state.cleanup(false)
 			return protocol.Result{}, fmt.Errorf("Codex thread/start returned no thread id")
 		}
+		effort := protocol.Effort(req, p.cfg.DefaultEffort)
 		turnParams := map[string]any{
 			"threadId": state.threadID,
-			"effort":   protocol.Effort(req, p.cfg.DefaultEffort),
+			"effort":   effort,
 			"input":    input,
+		}
+		if effort != "none" && !protocol.IsCompactionRequest(req) {
+			turnParams["summary"] = "auto"
 		}
 		if tier := protocol.ServiceTier(req); tier != "" {
 			turnParams["serviceTier"] = tier
@@ -331,6 +338,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		StopReason: "end_turn",
 	}
 	var textIndex = -1
+	reasoningIndexes := make(map[string]int)
 	var toolTimer <-chan time.Time
 	var timer *time.Timer
 	idleTimer := time.NewTimer(eventIdleTimeout)
@@ -382,6 +390,33 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 			}
 			idleTimer.Reset(eventIdleTimeout)
 			switch envelope.Method {
+			case "item/reasoning/summaryTextDelta":
+				delta := stringValue(envelope.Params["delta"])
+				if delta == "" {
+					continue
+				}
+				itemID := first(stringValue(envelope.Params["itemId"]), "reasoning")
+				index, exists := reasoningIndexes[itemID]
+				if !exists {
+					index = len(result.Blocks)
+					reasoningIndexes[itemID] = index
+					block := protocol.Block{
+						Type:      "thinking",
+						Signature: "macaz-codexcli-reasoning-summary",
+					}
+					result.Blocks = append(result.Blocks, block)
+					if req.Stream && emit != nil {
+						if err := emit(protocol.Event{Kind: protocol.EventBlockStart, Index: index, Block: block}); err != nil {
+							return protocol.Result{}, err
+						}
+					}
+				}
+				result.Blocks[index].Thinking += delta
+				if req.Stream && emit != nil {
+					if err := emit(protocol.Event{Kind: protocol.EventBlockDelta, Index: index, DeltaType: "thinking_delta", Delta: delta}); err != nil {
+						return protocol.Result{}, err
+					}
+				}
 			case "item/agentMessage/delta":
 				delta := stringValue(envelope.Params["delta"])
 				if delta == "" {
@@ -487,6 +522,22 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 				if isNativeTool(itemType) {
 					return protocol.Result{}, fmt.Errorf("Codex attempted forbidden native tool %q", itemType)
 				}
+			case "item/completed":
+				item := mapValue(envelope.Params["item"])
+				if stringValue(item["type"]) != "reasoning" {
+					continue
+				}
+				itemID := stringValue(item["id"])
+				index, exists := reasoningIndexes[itemID]
+				if !exists {
+					continue
+				}
+				if req.Stream && emit != nil {
+					if err := emit(protocol.Event{Kind: protocol.EventBlockStop, Index: index}); err != nil {
+						return protocol.Result{}, err
+					}
+				}
+				delete(reasoningIndexes, itemID)
 			case "turn/completed":
 				if timer != nil {
 					continue
@@ -564,9 +615,12 @@ func appServerArgs() []string {
 		"--disable", "plugins",
 		"--disable", "shell_tool",
 		"--disable", "unified_exec",
+		"--disable", "code_mode",
 		"--disable", "code_mode_host",
+		"--disable", "code_mode_only",
 		"--disable", "tool_suggest",
 		"-c", `web_search="disabled"`,
+		"-c", `tools.experimental_request_user_input.enabled=false`,
 		"-c", `mcp_servers={}`,
 		"-c", `project_doc_max_bytes=0`,
 		"-c", `include_permissions_instructions=false`,
@@ -584,10 +638,11 @@ func threadStartParams(model, cwd, system string, dynamicTools []map[string]any)
 		"model":                      model,
 		"cwd":                        cwd,
 		"approvalPolicy":             "never",
-		"sandbox":                    "danger-full-access",
+		"sandbox":                    "read-only",
+		"environments":               []any{},
 		"ephemeral":                  true,
 		"baseInstructions":           system,
-		"developerInstructions":      "",
+		"developerInstructions":      bridgeInstructions,
 		"dynamicTools":               dynamicTools,
 		"allowProviderModelFallback": false,
 	}
@@ -684,7 +739,7 @@ func canonicalCodexPath(path, cwd string) string {
 
 func isNativeTool(itemType string) bool {
 	switch itemType {
-	case "", "userMessage", "agentMessage", "reasoning", "plan", "dynamicToolCall":
+	case "", "userMessage", "agentMessage", "reasoning", "dynamicToolCall":
 		return false
 	default:
 		// Fail closed when a newer Codex release introduces another thread item.
