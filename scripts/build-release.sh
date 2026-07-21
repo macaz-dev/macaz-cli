@@ -62,14 +62,6 @@ else
 	done
 fi
 
-cp "$ROOT/README.md" "$OUTPUT_DIR/README.md"
-cp "$ROOT/scripts/install.sh" "$OUTPUT_DIR/install.sh"
-chmod 755 "$OUTPUT_DIR/install.sh"
-cp "$ROOT/THIRD_PARTY_NOTICES.md" "$OUTPUT_DIR/THIRD_PARTY_NOTICES.md"
-cp "$ROOT/LICENSE" "$OUTPUT_DIR/LICENSE"
-cp "$ROOT/NOTICE" "$OUTPUT_DIR/NOTICE"
-cp "$ROOT/LEGAL.md" "$OUTPUT_DIR/LEGAL.md"
-cp "$ROOT/PRIVACY.md" "$OUTPUT_DIR/PRIVACY.md"
 (
 	cd "$OUTPUT_DIR"
 	if command -v sha256sum >/dev/null 2>&1; then
@@ -84,5 +76,5 @@ cp "$ROOT/PRIVACY.md" "$OUTPUT_DIR/PRIVACY.md"
 
 printf '%s\n' "Version: $VERSION"
 printf '%s\n' "Production directory: $OUTPUT_DIR"
-printf '%s\n' "Public documentation and checksums were added."
+printf '%s\n' "Platform binaries and checksums were added."
 printf '%s\n' "Access: free and unrestricted under Apache-2.0."

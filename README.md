@@ -260,8 +260,8 @@ Build a complete local release package into ignored `dist/`:
 ```
 
 The release script requires an empty output directory and creates static
-macOS, Linux, and Windows binaries for amd64 and arm64, plus checksums and the
-installer. To choose another empty directory:
+macOS, Linux, and Windows binaries for amd64 and arm64, plus `SHA256SUMS` for
+installer and updater verification. To choose another empty directory:
 
 ```sh
 OUTPUT_DIR=/tmp/macaz-release ./scripts/build-release.sh v1.0.0
