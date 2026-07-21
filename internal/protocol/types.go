@@ -218,9 +218,49 @@ func Effort(req *Request, fallback string) string {
 	}
 	switch effort {
 	case "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+		if IsCompactionRequest(req) && effortRank(effort) > effortRank("low") {
+			return "low"
+		}
 		return effort
 	default:
+		if IsCompactionRequest(req) {
+			return "low"
+		}
 		return "high"
+	}
+}
+
+func IsCompactionRequest(req *Request) bool {
+	if req == nil {
+		return false
+	}
+	system, err := SystemText(req.System)
+	if err != nil {
+		return false
+	}
+	system = strings.ToLower(system)
+	return strings.Contains(system, "tasked with summarizing conversations") ||
+		(strings.Contains(system, "summarize the conversation") && strings.Contains(system, "continue"))
+}
+
+func effortRank(effort string) int {
+	switch effort {
+	case "none":
+		return 0
+	case "minimal":
+		return 1
+	case "low":
+		return 2
+	case "medium":
+		return 3
+	case "high":
+		return 4
+	case "xhigh":
+		return 5
+	case "max", "ultra":
+		return 6
+	default:
+		return 4
 	}
 }
 

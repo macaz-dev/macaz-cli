@@ -1,13 +1,125 @@
 package openresponses
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/macaz-dev/macaz-cli/internal/protocol"
 )
+
+func TestCollectorRejectsStreamWithoutTerminalEvent(t *testing.T) {
+	collector := NewCollector("gpt-test", protocol.NewToolNames(nil), false, nil)
+	stream := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"partial\"}\n\n"
+	if err := ReadSSE(bytes.NewBufferString(stream), collector.Handle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collector.Finalize(); err == nil || !strings.Contains(err.Error(), "without a terminal") {
+		t.Fatalf("finalize error = %v", err)
+	}
+}
+
+func TestCollectorRejectsInvalidToolArguments(t *testing.T) {
+	collector := NewCollector("gpt-test", protocol.NewToolNames([]protocol.Tool{{Name: "Read"}}), false, nil)
+	if err := collector.Handle("response.output_item.added", []byte(`{
+		"type":"response.output_item.added",
+		"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"Read"}
+	}`)); err != nil {
+		t.Fatal(err)
+	}
+	err := collector.Handle("response.output_item.done", []byte(`{
+		"type":"response.output_item.done",
+		"item":{"id":"fc_1","type":"function_call","arguments":"{invalid"}
+	}`))
+	if err == nil || !strings.Contains(err.Error(), "invalid or empty JSON") {
+		t.Fatalf("tool argument error = %v", err)
+	}
+}
+
+func TestCollectorFinalizesOnlyAfterTerminalEvent(t *testing.T) {
+	collector := NewCollector("gpt-test", protocol.NewToolNames(nil), false, nil)
+	if err := collector.Handle("response.completed", []byte(`{
+		"type":"response.completed",
+		"response":{"id":"resp_ok","model":"gpt-test","status":"completed"}
+	}`)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := collector.Finalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ID != "resp_ok" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestCollectorRepairsWhitespaceStalledReadCall(t *testing.T) {
+	var events []protocol.Event
+	collector := NewCollector("gpt-test", protocol.NewToolNames([]protocol.Tool{{Name: "Read"}}), true, func(event protocol.Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if err := collector.Handle("response.output_item.added", []byte(`{
+		"type":"response.output_item.added",
+		"item":{"id":"fc_read","type":"function_call","call_id":"call_read","name":"Read"}
+	}`)); err != nil {
+		t.Fatal(err)
+	}
+	delta, err := json.Marshal(map[string]any{
+		"type":    "response.function_call_arguments.delta",
+		"item_id": "fc_read",
+		"delta":   `{"file_path":"README.md","pages":"","offset":1300000` + strings.Repeat(" ", readRepairTrailingWhitespace),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = collector.Handle("response.function_call_arguments.delta", delta)
+	if !errors.Is(err, ErrToolCallReady) {
+		t.Fatalf("repair signal = %v", err)
+	}
+	result, err := collector.Finalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Blocks) != 1 || string(result.Blocks[0].Input) != `{"file_path":"README.md"}` {
+		t.Fatalf("repaired blocks = %#v", result.Blocks)
+	}
+	if !result.Usage.Estimated || result.Usage.OutputTokens == 0 {
+		t.Fatalf("repaired usage = %#v", result.Usage)
+	}
+	if len(events) != 3 || events[1].Delta != `{"file_path":"README.md"}` || events[2].Kind != protocol.EventBlockStop {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestCollectorDoesNotCloseParallelCallsToRepairRead(t *testing.T) {
+	collector := NewCollector("gpt-test", protocol.NewToolNames([]protocol.Tool{{Name: "Read"}, {Name: "Bash"}}), false, nil)
+	for _, item := range []string{
+		`{"type":"response.output_item.added","item":{"id":"fc_read","type":"function_call","call_id":"call_read","name":"Read"}}`,
+		`{"type":"response.output_item.added","item":{"id":"fc_bash","type":"function_call","call_id":"call_bash","name":"Bash"}}`,
+	} {
+		if err := collector.Handle("response.output_item.added", []byte(item)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delta, err := json.Marshal(map[string]any{
+		"type":    "response.function_call_arguments.delta",
+		"item_id": "fc_read",
+		"delta":   `{"file_path":"README.md"` + strings.Repeat(" ", readRepairTrailingWhitespace),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := collector.Handle("response.function_call_arguments.delta", delta); err != nil {
+		t.Fatalf("parallel repair unexpectedly terminated the stream: %v", err)
+	}
+	if len(collector.open) != 2 || collector.terminal {
+		t.Fatalf("collector state: open=%#v terminal=%t", collector.open, collector.terminal)
+	}
+}
 
 func TestCollectorFailsClosedOnFailedResponse(t *testing.T) {
 	collector := NewCollector("gpt-test", protocol.NewToolNames(nil), false, nil)
@@ -22,6 +134,34 @@ func TestCollectorFailsClosedOnFailedResponse(t *testing.T) {
 	}`))
 	if err == nil || !strings.Contains(err.Error(), "upstream generation failed") {
 		t.Fatalf("error = %v", err)
+	}
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) || streamErr.Code != "server_error" {
+		t.Fatalf("typed stream error = %#v", err)
+	}
+}
+
+func TestCollectorTypesOpenRouterMidStreamErrorAndClosesBlocks(t *testing.T) {
+	var events []protocol.Event
+	collector := NewCollector("gpt-test", protocol.NewToolNames(nil), true, func(event protocol.Event) error {
+		events = append(events, event)
+		return nil
+	})
+	if err := collector.Handle("response.output_text.delta", []byte(`{
+		"type":"response.output_text.delta","item_id":"m1","delta":"partial"
+	}`)); err != nil {
+		t.Fatal(err)
+	}
+	err := collector.Handle("error", []byte(`{
+		"type":"error","error_type":"provider_overloaded",
+		"error":{"code":503,"message":"provider is overloaded"}
+	}`))
+	var streamErr *StreamError
+	if !errors.As(err, &streamErr) || streamErr.Type != "provider_overloaded" || streamErr.Code != "503" {
+		t.Fatalf("stream error = %#v", err)
+	}
+	if len(events) != 3 || events[2].Kind != protocol.EventBlockStop {
+		t.Fatalf("events = %#v", events)
 	}
 }
 

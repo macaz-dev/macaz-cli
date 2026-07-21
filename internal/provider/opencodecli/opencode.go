@@ -23,6 +23,8 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/provider"
 )
 
+const openCodeEventIdleTimeout = 5 * time.Minute
+
 type Provider struct {
 	cfg      config.Config
 	modelMu  sync.Mutex
@@ -194,6 +196,8 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	if err := command.Start(); err != nil {
 		return protocol.Result{}, fmt.Errorf("start OpenCode: %w", err)
 	}
+	watchdog := newIdleCanceller(cancel, openCodeEventIdleTimeout)
+	defer watchdog.stop()
 
 	result := protocol.Result{
 		ID:         "msg_opencode_" + strconv.FormatInt(time.Now().UnixNano(), 36),
@@ -205,6 +209,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64<<10), 32<<20)
 	for scanner.Scan() {
+		watchdog.touch()
 		line := append([]byte(nil), scanner.Bytes()...)
 		_, _ = rawEvents.Write(line)
 		_, _ = rawEvents.Write([]byte{'\n'})
@@ -341,6 +346,9 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	}
 	scanErr := scanner.Err()
 	waitErr := command.Wait()
+	if watchdog.expired() {
+		return protocol.Result{}, provider.Timeout("OpenCode produced no events before the idle timeout")
+	}
 	if scanErr != nil {
 		return protocol.Result{}, fmt.Errorf("read OpenCode events: %w", scanErr)
 	}
@@ -354,7 +362,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		}
 		return protocol.Result{}, eventError
 	}
-	if waitErr != nil && len(result.Blocks) == 0 {
+	if waitErr != nil {
 		return protocol.Result{}, fmt.Errorf(
 			"OpenCode failed: %w%s",
 			waitErr,
@@ -409,6 +417,9 @@ func openCodeEventError(name, message string, status int, retryable bool, respon
 	if status <= 0 {
 		status = http.StatusBadGateway
 	}
+	if provider.IsContextWindowOverflow(message) {
+		return provider.ContextWindowOverflow(message, responseBody)
+	}
 	retryAfter := time.Duration(0)
 	if retryable && (status == http.StatusTooManyRequests || status >= http.StatusInternalServerError) {
 		retryAfter = time.Second
@@ -435,6 +446,61 @@ func openCodeDiagnostics(stderr, events string) string {
 	default:
 		return ""
 	}
+}
+
+type idleCanceller struct {
+	cancel     context.CancelFunc
+	timeout    time.Duration
+	mu         sync.Mutex
+	timer      *time.Timer
+	generation uint64
+	closed     bool
+	timedOut   bool
+}
+
+func newIdleCanceller(cancel context.CancelFunc, timeout time.Duration) *idleCanceller {
+	watchdog := &idleCanceller{cancel: cancel, timeout: timeout, generation: 1}
+	watchdog.timer = time.AfterFunc(timeout, func() { watchdog.expire(1) })
+	return watchdog
+}
+
+func (w *idleCanceller) touch() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed || w.timedOut {
+		return
+	}
+	w.generation++
+	generation := w.generation
+	w.timer.Stop()
+	w.timer = time.AfterFunc(w.timeout, func() { w.expire(generation) })
+}
+
+func (w *idleCanceller) stop() {
+	w.mu.Lock()
+	if !w.closed {
+		w.closed = true
+		w.generation++
+		w.timer.Stop()
+	}
+	w.mu.Unlock()
+}
+
+func (w *idleCanceller) expired() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.timedOut
+}
+
+func (w *idleCanceller) expire(generation uint64) {
+	w.mu.Lock()
+	if w.closed || w.timedOut || generation != w.generation {
+		w.mu.Unlock()
+		return
+	}
+	w.timedOut = true
+	w.mu.Unlock()
+	w.cancel()
 }
 
 func mergeEnvironment(current, overrides []string) []string {
@@ -523,18 +589,49 @@ func parseModels(output []byte, selected string) []provider.Model {
 				}
 			}
 		}
+		contextWindow := modelInt64(metadata["context_window"])
+		maxOutputTokens := modelInt64(metadata["max_output_tokens"])
+		if limits, ok := metadata["limit"].(map[string]any); ok {
+			if contextWindow == 0 {
+				contextWindow = modelInt64(limits["context"])
+			}
+			if maxOutputTokens == 0 {
+				maxOutputTokens = modelInt64(limits["output"])
+			}
+		}
 		models = append(models, provider.Model{
-			ID:              id,
-			DisplayName:     openCodeModelDisplayName(id, first(stringValue(metadata["name"]), id)),
-			Default:         selected != "" && id == selected,
-			Efforts:         efforts,
-			InputModalities: modalities,
+			ID:                  id,
+			DisplayName:         openCodeModelDisplayName(id, first(stringValue(metadata["name"]), id)),
+			Default:             selected != "" && id == selected,
+			Efforts:             efforts,
+			InputModalities:     modalities,
+			SupportedParameters: []string{"tools", "tool_choice", "reasoning_effort"},
+			ContextWindow:       contextWindow,
+			MaxOutputTokens:     maxOutputTokens,
+			ToolCall:            true,
+			Attachment:          len(modalities) > 1,
 		})
 	}
 	if len(models) > 0 && strings.TrimSpace(selected) == "" {
 		models[0].Default = true
 	}
 	return models
+}
+
+func modelInt64(value any) int64 {
+	switch value := value.(type) {
+	case float64:
+		return int64(value)
+	case json.Number:
+		result, _ := value.Int64()
+		return result
+	case int64:
+		return value
+	case int:
+		return int64(value)
+	default:
+		return 0
+	}
 }
 
 func openCodeModelDisplayName(id, name string) string {

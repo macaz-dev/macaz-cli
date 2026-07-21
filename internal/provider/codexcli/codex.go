@@ -21,18 +21,26 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/provider"
 )
 
-const parallelToolGrace = 150 * time.Millisecond
+const (
+	parallelToolGrace   = 300 * time.Millisecond
+	requestPhaseTimeout = 60 * time.Second
+	eventIdleTimeout    = 5 * time.Minute
+)
 
 type Provider struct {
-	cfg      config.Config
-	modelMu  sync.Mutex
-	models   []provider.Model
-	modelsAt time.Time
-	poolMu   sync.Mutex
-	slots    chan struct{}
-	idle     chan *appServer
-	servers  map[*appServer]struct{}
-	closed   bool
+	cfg            config.Config
+	modelMu        sync.Mutex
+	models         []provider.Model
+	modelsAt       time.Time
+	poolMu         sync.Mutex
+	slots          chan struct{}
+	parkedSlots    chan struct{}
+	idle           chan *appServer
+	servers        map[*appServer]struct{}
+	sessionMu      sync.Mutex
+	sessions       map[string]*codexTurnState
+	sessionsClosed bool
+	closed         bool
 }
 
 func New(cfg config.Config) *Provider {
@@ -40,7 +48,15 @@ func New(cfg config.Config) *Provider {
 	if limit < 1 {
 		limit = 1
 	}
-	return &Provider{cfg: cfg, slots: make(chan struct{}, limit), idle: make(chan *appServer, limit), servers: make(map[*appServer]struct{})}
+	parkedLimit := limit - 1
+	return &Provider{
+		cfg:         cfg,
+		slots:       make(chan struct{}, limit),
+		parkedSlots: make(chan struct{}, parkedLimit),
+		idle:        make(chan *appServer, limit),
+		servers:     make(map[*appServer]struct{}),
+		sessions:    make(map[string]*codexTurnState),
+	}
 }
 
 func (p *Provider) Name() string {
@@ -160,6 +176,13 @@ func (p *Provider) discoverModels(ctx context.Context) ([]provider.Model, error)
 				}
 			}
 			modalities := stringSlice(item["inputModalities"])
+			contextWindow := int64Value(item["contextWindow"])
+			if contextWindow == 0 {
+				contextWindow = int64Value(item["contextWindowSize"])
+			}
+			if contextWindow == 0 {
+				contextWindow = int64Value(item["context_window"])
+			}
 			models = append(models, provider.Model{
 				ID:              modelID,
 				DisplayName:     first(stringValue(item["displayName"]), modelID),
@@ -167,6 +190,7 @@ func (p *Provider) discoverModels(ctx context.Context) ([]provider.Model, error)
 				Default:         boolValue(item["isDefault"]),
 				Efforts:         efforts,
 				InputModalities: modalities,
+				ContextWindow:   contextWindow,
 			})
 		}
 		next := stringValue(response["nextCursor"])
@@ -185,10 +209,6 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 	selectedModel, err := p.selectModel(ctx, req.Model)
 	if err != nil {
 		return protocol.Result{}, err
-	}
-	transcript, requestAttachments, err := protocol.TranscriptWithAttachments(req)
-	if err != nil {
-		return protocol.Result{}, provider.InvalidRequest(err)
 	}
 	system, err := protocol.SystemText(req.System)
 	if err != nil {
@@ -220,88 +240,147 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 			"inputSchema": schema,
 		})
 	}
-	requestDir, err := os.MkdirTemp("", "macaz-codex-*")
+	shapeSignature := requestShapeSignature(selectedModel, system, dynamicTools, toolPolicy)
+	state, toolResults, resumed, err := p.claimPending(req.PromptCacheKey, shapeSignature, req)
 	if err != nil {
-		return protocol.Result{}, err
+		return protocol.Result{}, provider.InvalidRequest(err)
 	}
-	defer os.RemoveAll(requestDir)
-	input, err := codexInputs(ctx, requestDir, transcript, requestAttachments)
-	if err != nil {
-		return protocol.Result{}, err
+	if resumed {
+		if err := state.answerPending(toolResults); err != nil {
+			p.finishPending(req.PromptCacheKey, state, false)
+			return protocol.Result{}, withStderr(err, state.server.stderr.String())
+		}
+	} else {
+		transcript, requestAttachments, err := protocol.TranscriptWithAttachments(req)
+		if err != nil {
+			return protocol.Result{}, provider.InvalidRequest(err)
+		}
+		requestDir, err := os.MkdirTemp("", "macaz-codex-*")
+		if err != nil {
+			return protocol.Result{}, err
+		}
+		input, err := codexInputs(ctx, requestDir, transcript, requestAttachments)
+		if err != nil {
+			_ = os.RemoveAll(requestDir)
+			return protocol.Result{}, err
+		}
+		server, release, err := p.acquireServer(ctx)
+		if err != nil {
+			_ = os.RemoveAll(requestDir)
+			return protocol.Result{}, err
+		}
+		state = &codexTurnState{
+			server:            server,
+			release:           release,
+			requestDir:        requestDir,
+			model:             selectedModel,
+			shapeSignature:    shapeSignature,
+			allowedImageViews: codexImagePaths(input, requestDir),
+			pending:           make(map[string]json.RawMessage),
+			claimed:           true,
+		}
+
+		threadParams := threadStartParams(selectedModel, requestDir, system, dynamicTools)
+		threadCtx, cancelThread := context.WithTimeout(ctx, requestPhaseTimeout)
+		threadResponse, threadErr := server.request(threadCtx, "thread/start", threadParams)
+		cancelThread()
+		if threadErr != nil {
+			state.cleanup(false)
+			return protocol.Result{}, withStderr(threadErr, server.stderr.String())
+		}
+		state.threadID = nestedString(threadResponse, "thread", "id")
+		if state.threadID == "" {
+			state.cleanup(false)
+			return protocol.Result{}, fmt.Errorf("Codex thread/start returned no thread id")
+		}
+		turnParams := map[string]any{
+			"threadId": state.threadID,
+			"effort":   protocol.Effort(req, p.cfg.DefaultEffort),
+			"input":    input,
+		}
+		if tier := protocol.ServiceTier(req); tier != "" {
+			turnParams["serviceTier"] = tier
+		}
+		turnCtx, cancelTurn := context.WithTimeout(ctx, requestPhaseTimeout)
+		turnResponse, turnErr := server.request(turnCtx, "turn/start", turnParams)
+		cancelTurn()
+		if turnErr != nil {
+			state.cleanup(false)
+			return protocol.Result{}, withStderr(turnErr, server.stderr.String())
+		}
+		state.turnID = nestedString(turnResponse, "turn", "id")
+		if state.turnID == "" {
+			state.cleanup(false)
+			return protocol.Result{}, fmt.Errorf("Codex turn/start returned no turn id")
+		}
 	}
-	allowedImageViews := codexImagePaths(input, requestDir)
-	server, release, err := p.acquireServer(ctx)
-	if err != nil {
-		return protocol.Result{}, err
-	}
+
 	healthy := false
-	defer func() { release(healthy) }()
+	parked := false
+	defer func() {
+		if !parked {
+			p.finishPending(req.PromptCacheKey, state, healthy)
+		}
+	}()
+	server := state.server
 	rpc := server.rpc
 
-	threadParams := threadStartParams(selectedModel, requestDir, system, dynamicTools)
-	threadResponse, err := server.request(ctx, "thread/start", threadParams)
-	if err != nil {
-		return protocol.Result{}, withStderr(err, server.stderr.String())
-	}
-	threadID := nestedString(threadResponse, "thread", "id")
-	if threadID == "" {
-		return protocol.Result{}, fmt.Errorf("Codex thread/start returned no thread id")
-	}
-	turnParams := map[string]any{
-		"threadId": threadID,
-		"effort":   protocol.Effort(req, p.cfg.DefaultEffort),
-		"input":    input,
-	}
-	if tier := protocol.ServiceTier(req); tier != "" {
-		turnParams["serviceTier"] = tier
-	}
-	turnResponse, err := server.request(ctx, "turn/start", turnParams)
-	if err != nil {
-		return protocol.Result{}, withStderr(err, server.stderr.String())
-	}
-	turnID := nestedString(turnResponse, "turn", "id")
-	if turnID == "" {
-		return protocol.Result{}, fmt.Errorf("Codex turn/start returned no turn id")
-	}
-
 	result := protocol.Result{
-		ID:         "msg_" + threadID,
+		ID:         "msg_" + state.threadID,
 		Model:      selectedModel,
 		StopReason: "end_turn",
 	}
 	var textIndex = -1
 	var toolTimer <-chan time.Time
 	var timer *time.Timer
+	idleTimer := time.NewTimer(eventIdleTimeout)
 	finishTools := func() {
 		if timer != nil {
 			timer.Stop()
 		}
 	}
 	defer finishTools()
+	defer idleTimer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return protocol.Result{}, ctx.Err()
+		case <-idleTimer.C:
+			return protocol.Result{}, provider.Timeout("Codex app-server produced no turn events before the idle timeout")
 		case <-toolTimer:
-			for i := range result.Blocks {
-				if req.Stream && emit != nil {
+			for i, block := range result.Blocks {
+				if block.Type == "tool_use" && req.Stream && emit != nil {
 					_ = emit(protocol.Event{Kind: protocol.EventBlockStop, Index: i})
 				}
 			}
 			result.StopReason = "tool_use"
-			healthy = server.interruptAndQuiesce(ctx, threadID, turnID)
+			if len(state.pending) > 0 && strings.TrimSpace(req.PromptCacheKey) != "" {
+				preserved, err := p.parkPending(req.PromptCacheKey, state)
+				if err != nil {
+					return protocol.Result{}, err
+				}
+				if preserved {
+					parked = true
+					return result, nil
+				}
+			}
+			healthy = server.interruptAndQuiesce(ctx, state.threadID, state.turnID)
 			return result, nil
 		case envelope, ok := <-rpc.events:
 			if !ok {
-				if len(result.Blocks) > 0 {
-					return result, nil
-				}
 				return protocol.Result{}, withStderr(errors.New("Codex app-server closed its output"), server.stderr.String())
 			}
 			if envelope.Error != nil {
 				return protocol.Result{}, withStderr(envelope.Error, server.stderr.String())
 			}
+			if !idleTimer.Stop() {
+				select {
+				case <-idleTimer.C:
+				default:
+				}
+			}
+			idleTimer.Reset(eventIdleTimeout)
 			switch envelope.Method {
 			case "item/agentMessage/delta":
 				delta := stringValue(envelope.Params["delta"])
@@ -334,11 +413,15 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 				if err != nil {
 					return protocol.Result{}, err
 				}
+				callID := first(stringValue(envelope.Params["callId"]), "toolu_codex")
 				block := protocol.Block{
 					Type:  "tool_use",
-					ID:    first(stringValue(envelope.Params["callId"]), "toolu_codex"),
+					ID:    callID,
 					Name:  names.Client(stringValue(envelope.Params["tool"])),
 					Input: rawArgs,
+				}
+				if len(envelope.ID) > 0 {
+					state.pending[callID] = append(json.RawMessage(nil), envelope.ID...)
 				}
 				index := len(result.Blocks)
 				result.Blocks = append(result.Blocks, block)
@@ -355,7 +438,17 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 						_ = emit(protocol.Event{Kind: protocol.EventBlockStop, Index: index})
 					}
 					result.StopReason = "tool_use"
-					healthy = server.interruptAndQuiesce(ctx, threadID, turnID)
+					if len(state.pending) > 0 && strings.TrimSpace(req.PromptCacheKey) != "" {
+						preserved, err := p.parkPending(req.PromptCacheKey, state)
+						if err != nil {
+							return protocol.Result{}, err
+						}
+						if preserved {
+							parked = true
+							return result, nil
+						}
+					}
+					healthy = server.interruptAndQuiesce(ctx, state.threadID, state.turnID)
 					return result, nil
 				}
 				if timer == nil {
@@ -383,7 +476,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 				item := mapValue(envelope.Params["item"])
 				itemType := stringValue(item["type"])
 				if itemType == "imageView" {
-					if !allowedCodexImageView(item, allowedImageViews, requestDir) {
+					if !allowedCodexImageView(item, state.allowedImageViews, state.requestDir) {
 						return protocol.Result{}, fmt.Errorf(
 							"Codex attempted image view outside request attachments: %#v",
 							item,
@@ -407,6 +500,9 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 						stringValue(turnError["additionalDetails"]),
 						"Codex turn failed",
 					)
+					if provider.IsContextWindowOverflow(message) {
+						return protocol.Result{}, provider.ContextWindowOverflow(message, nil)
+					}
 					return protocol.Result{}, fmt.Errorf("%s", message)
 				case "interrupted":
 					return protocol.Result{}, errors.New("Codex turn was interrupted before returning a result")
@@ -420,7 +516,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 				if len(result.Blocks) == 0 {
 					return protocol.Result{}, errors.New("Codex returned no text or client tool call")
 				}
-				healthy = server.quiesceThread(ctx, threadID)
+				healthy = server.quiesceThread(ctx, state.threadID)
 				return result, nil
 			case "error":
 				return protocol.Result{}, fmt.Errorf("Codex app-server error: %v", envelope.Params)
@@ -675,6 +771,13 @@ func (r *rpcClient) sendRequest(id int, method string, params any) error {
 
 func (r *rpcClient) notify(method string, params any) error {
 	return r.write(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+}
+
+func (r *rpcClient) respond(id json.RawMessage, result any) error {
+	if len(id) == 0 {
+		return errors.New("Codex app-server tool request has no JSON-RPC id")
+	}
+	return r.write(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
 }
 
 func (r *rpcClient) write(value any) error {

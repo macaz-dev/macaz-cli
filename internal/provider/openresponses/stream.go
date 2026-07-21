@@ -9,10 +9,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 
 	"github.com/macaz-dev/macaz-cli/internal/protocol"
 )
+
+var ErrToolCallReady = errors.New("OpenResponses tool call completed before the upstream terminal event")
+
+type StreamError struct {
+	Type    string
+	Code    string
+	Message string
+}
+
+func (e *StreamError) Error() string {
+	return first(e.Message, e.Code, e.Type, "OpenResponses stream failed")
+}
+
+const readRepairTrailingWhitespace = 1024
 
 type Collector struct {
 	model      string
@@ -26,6 +41,7 @@ type Collector struct {
 	arguments  map[int]string
 	stopReason string
 	usage      protocol.Usage
+	terminal   bool
 }
 
 func NewCollector(model string, names *protocol.ToolNames, stream bool, emit protocol.EmitFunc) *Collector {
@@ -121,6 +137,28 @@ func (c *Collector) Handle(event string, data []byte) error {
 		}
 		delta := stringValue(payload["delta"])
 		c.arguments[index] += delta
+		if c.isRead(index) {
+			// Only synthesize a terminal tool response when this Read call is the
+			// sole open block. Closing parallel, incomplete calls would fabricate
+			// tool results that the upstream never completed.
+			if len(c.open) == 1 {
+				if repaired, ok := repairWhitespaceStalledReadArguments(c.arguments[index]); ok {
+					c.arguments[index] = repaired
+					c.blocks[index].Input = json.RawMessage(repaired)
+					if err := c.delta(index, "input_json_delta", repaired); err != nil {
+						return err
+					}
+					if err := c.stop(index); err != nil {
+						return err
+					}
+					c.usage.Estimated = true
+					c.usage.OutputTokens = int64(max(1, (len(c.arguments[index])+3)/4))
+					c.terminal = true
+					return ErrToolCallReady
+				}
+			}
+			return nil
+		}
 		return c.delta(index, "input_json_delta", delta)
 	case "response.output_item.done":
 		item := mapValue(payload["item"])
@@ -158,14 +196,25 @@ func (c *Collector) Handle(event string, data []byte) error {
 			full := c.arguments[index]
 			if full == "" && item != nil {
 				full = stringValue(item["arguments"])
-				if full != "" && c.stream {
+				if full != "" && c.stream && !c.isRead(index) {
 					if err := c.delta(index, "input_json_delta", full); err != nil {
 						return err
 					}
 				}
 			}
-			if full == "" || !json.Valid([]byte(full)) {
-				full = "{}"
+			if c.isRead(index) {
+				var err error
+				full, err = sanitizeReadArguments(full)
+				if err != nil {
+					return err
+				}
+				if c.stream {
+					if err := c.delta(index, "input_json_delta", full); err != nil {
+						return err
+					}
+				}
+			} else if full == "" || !json.Valid([]byte(full)) {
+				return fmt.Errorf("OpenResponses tool %q returned invalid or empty JSON arguments", c.blocks[index].Name)
 			}
 			c.blocks[index].Input = json.RawMessage(full)
 		} else if c.blocks[index].Type == "thinking" && item != nil {
@@ -200,6 +249,7 @@ func (c *Collector) Handle(event string, data []byte) error {
 		if err := c.closeOpen(); err != nil {
 			return err
 		}
+		c.terminal = true
 		switch status {
 		case "completed":
 			return nil
@@ -218,23 +268,91 @@ func (c *Collector) Handle(event string, data []byte) error {
 				return fmt.Errorf("OpenResponses response incomplete: %s", reason)
 			}
 		case "failed":
-			return fmt.Errorf("OpenResponses response failed: %s", responseError(response))
+			failure := responseStreamError(response)
+			failure.Type = first(stringValue(payload["error_type"]), failure.Type)
+			return failure
 		case "cancelled", "canceled":
 			return errors.New("OpenResponses response cancelled")
 		default:
 			return fmt.Errorf("OpenResponses response ended with status %q", status)
 		}
 	case "error":
-		message := stringValue(payload["message"])
-		if nested := mapValue(payload["error"]); message == "" && nested != nil {
-			message = first(stringValue(nested["message"]), stringValue(nested["code"]))
+		if err := c.closeOpen(); err != nil {
+			return err
 		}
-		if message == "" {
-			message = string(data)
-		}
-		return errors.New(message)
+		return responseStreamError(payload)
 	}
 	return nil
+}
+
+func (c *Collector) isRead(index int) bool {
+	return index >= 0 && index < len(c.blocks) && strings.EqualFold(c.blocks[index].Name, "Read")
+}
+
+func sanitizeReadArguments(arguments string) (string, error) {
+	var object map[string]any
+	if arguments == "" || json.Unmarshal([]byte(arguments), &object) != nil || object == nil {
+		return "", errors.New("OpenResponses Read tool returned invalid or empty JSON arguments")
+	}
+	if pages, ok := object["pages"].(string); ok && pages == "" {
+		delete(object, "pages")
+	}
+	if offset, ok := object["offset"].(float64); ok && offset >= 1_000_000 {
+		delete(object, "offset")
+	}
+	raw, err := json.Marshal(object)
+	if err != nil {
+		return "", fmt.Errorf("encode repaired Read arguments: %w", err)
+	}
+	return string(raw), nil
+}
+
+func repairWhitespaceStalledReadArguments(arguments string) (string, bool) {
+	trimmed := strings.TrimRight(arguments, " \t\r\n")
+	if len(arguments)-len(trimmed) < readRepairTrailingWhitespace {
+		return "", false
+	}
+	for _, candidate := range []string{trimmed, trimmed + "}"} {
+		var object map[string]any
+		if json.Unmarshal([]byte(candidate), &object) != nil || !validReadArguments(object) {
+			continue
+		}
+		repaired, err := sanitizeReadArguments(candidate)
+		return repaired, err == nil
+	}
+	return "", false
+}
+
+func validReadArguments(object map[string]any) bool {
+	for key := range object {
+		switch key {
+		case "file_path", "offset", "limit", "pages":
+		default:
+			return false
+		}
+	}
+	filePath, ok := object["file_path"].(string)
+	if !ok || strings.TrimSpace(filePath) == "" {
+		return false
+	}
+	if offset, exists := object["offset"]; exists {
+		value, ok := offset.(float64)
+		if !ok || value < 0 || math.Trunc(value) != value {
+			return false
+		}
+	}
+	if limit, exists := object["limit"]; exists {
+		value, ok := limit.(float64)
+		if !ok || value <= 0 || math.Trunc(value) != value {
+			return false
+		}
+	}
+	if pages, exists := object["pages"]; exists {
+		if _, ok := pages.(string); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Collector) Result() protocol.Result {
@@ -248,6 +366,19 @@ func (c *Collector) Result() protocol.Result {
 		StopReason: c.stopReason,
 		Usage:      c.usage,
 	}
+}
+
+// Finalize rejects streams that ended without an explicit Responses terminal
+// event. Treating a clean TCP EOF as a successful model turn can replay a
+// partially emitted tool call when the client falls back or retries.
+func (c *Collector) Finalize() (protocol.Result, error) {
+	if !c.terminal {
+		return protocol.Result{}, errors.New("OpenResponses stream ended without a terminal response event")
+	}
+	if len(c.open) != 0 {
+		return protocol.Result{}, errors.New("OpenResponses stream ended with open content blocks")
+	}
+	return c.Result(), nil
 }
 
 func ReadSSE(reader io.Reader, fn func(event string, data []byte) error) error {
@@ -388,6 +519,25 @@ func responseError(response map[string]any) string {
 	)
 }
 
+func responseStreamError(response map[string]any) *StreamError {
+	if response == nil {
+		return &StreamError{Message: "provider returned no error details"}
+	}
+	detail := mapValue(response["error"])
+	if detail == nil {
+		detail = response
+	}
+	return &StreamError{
+		Type: first(
+			stringValue(response["error_type"]),
+			stringValue(detail["error_type"]),
+			stringValue(detail["type"]),
+		),
+		Code:    anyString(detail["code"]),
+		Message: first(stringValue(detail["message"]), responseError(response)),
+	}
+}
+
 func mapValue(value any) map[string]any {
 	result, _ := value.(map[string]any)
 	return result
@@ -396,6 +546,16 @@ func mapValue(value any) map[string]any {
 func stringValue(value any) string {
 	result, _ := value.(string)
 	return result
+}
+
+func anyString(value any) string {
+	if value == nil {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return fmt.Sprint(value)
 }
 
 func int64Value(value any) int64 {

@@ -32,6 +32,111 @@ func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
 }
 
+type contextReadCloser struct {
+	ctx context.Context
+}
+
+func (r contextReadCloser) Read([]byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func (contextReadCloser) Close() error { return nil }
+
+func TestIdleReadCloserCancelsStalledStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := openresponses.NewIdleReadCloser(contextReadCloser{ctx: ctx}, cancel, 5*time.Millisecond)
+	defer reader.Close()
+	_, err := reader.Read(make([]byte, 1))
+	if err == nil || !strings.Contains(err.Error(), "idle timeout") {
+		t.Fatalf("idle read error = %v", err)
+	}
+}
+
+func TestSubscriptionRejectsTruncatedStreamAndMapsContextOverflow(t *testing.T) {
+	keyring.MockInit()
+	if err := saveAccountCredential(accountCredentials{
+		Type: accountCredentialType, Method: accountCredentialMethod,
+		Access: "access-token", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Provider = config.ProviderOpenAISubscription
+	cfg.ModelMap["default"] = "gpt-test"
+	upstream, err := New(ModeSubscription, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	responseBody := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"delta\":\"partial\"}\n\n"
+	upstream.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(responseBody)), Request: req}, nil
+	})}
+	upstream.account.httpClient = upstream.httpClient
+	request := &protocol.Request{Model: "gpt-test", Messages: []protocol.Message{{Role: "user", Content: json.RawMessage(`"hello"`)}}}
+	if _, err := upstream.Generate(context.Background(), request, nil); err == nil || !strings.Contains(err.Error(), "without a terminal") {
+		t.Fatalf("truncated stream error = %v", err)
+	}
+
+	upstream.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadRequest, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader(`{"detail":"maximum context window exceeded"}`)), Request: req,
+		}, nil
+	})}
+	upstream.account.httpClient = upstream.httpClient
+	_, err = upstream.Generate(context.Background(), request, nil)
+	if provider.Status(err) != http.StatusRequestEntityTooLarge {
+		t.Fatalf("context overflow status = %d, err = %v", provider.Status(err), err)
+	}
+}
+
+func TestSubscriptionRefreshesOnceAfterStaleToken401(t *testing.T) {
+	keyring.MockInit()
+	if err := saveAccountCredential(accountCredentials{
+		Type: accountCredentialType, Method: accountCredentialMethod,
+		Access: "stale-access", Refresh: "refresh-token",
+		ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var responseAttempts atomic.Int64
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() == accountTokenEndpoint {
+			return &http.Response{
+				StatusCode: http.StatusOK, Header: make(http.Header), Request: req,
+				Body: io.NopCloser(strings.NewReader(`{"access_token":"fresh-access","refresh_token":"refresh-token","expires_in":3600}`)),
+			}, nil
+		}
+		responseAttempts.Add(1)
+		if req.Header.Get("Authorization") == "Bearer stale-access" {
+			return &http.Response{StatusCode: http.StatusUnauthorized, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"detail":"expired"}`)), Request: req}, nil
+		}
+		if req.Header.Get("Authorization") != "Bearer fresh-access" {
+			t.Fatalf("authorization = %q", req.Header.Get("Authorization"))
+		}
+		stream := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"status\":\"completed\"}}\n\n"
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(stream)), Request: req}, nil
+	})}
+	cfg := config.Default()
+	cfg.Provider = config.ProviderOpenAISubscription
+	upstream, err := New(ModeSubscription, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream.httpClient = client
+	upstream.account.httpClient = client
+	_, err = upstream.Generate(context.Background(), &protocol.Request{
+		Model: "gpt-test", Messages: []protocol.Message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if responseAttempts.Load() != 2 {
+		t.Fatalf("response attempts = %d", responseAttempts.Load())
+	}
+}
+
 func TestSubscriptionModelsUsesLiveCodexCatalog(t *testing.T) {
 	keyring.MockInit()
 	if err := saveAccountCredential(accountCredentials{
@@ -509,6 +614,26 @@ func TestSubscriptionGateIsScopedToPromptCacheKey(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("same session did not resume after release")
 	}
+}
+
+func TestSubscriptionGateAppliesGlobalAccountLimit(t *testing.T) {
+	cfg := config.Default()
+	cfg.MaxConcurrentSubscription = 1
+	upstream, err := New(ModeSubscription, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseFirst, err := upstream.acquireGenerate(context.Background(), &protocol.Request{PromptCacheKey: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if release, err := upstream.acquireGenerate(ctx, &protocol.Request{PromptCacheKey: "session-b"}); err == nil {
+		release()
+		t.Fatal("independent session bypassed the subscription account limit")
+	}
+	releaseFirst()
 }
 
 func TestSubscriptionRetryExhaustionIsBounded(t *testing.T) {

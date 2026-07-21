@@ -52,6 +52,7 @@ type sessionStats struct {
 	CacheRead     int64
 	CacheCreation int64
 	Reasoning     int64
+	Estimated     int64
 	LastModel     string
 	LastError     string
 }
@@ -559,6 +560,7 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 		"cache_read_input_tokens":     stats.CacheRead,
 		"cache_creation_input_tokens": stats.CacheCreation,
 		"reasoning_output_tokens":     stats.Reasoning,
+		"estimated_usage_requests":    stats.Estimated,
 		"last_model":                  stats.LastModel,
 		"last_error":                  stats.LastError,
 	})
@@ -573,6 +575,9 @@ func (s *Server) recordResult(result protocol.Result) {
 	s.stats.CacheRead += result.Usage.CacheReadInputTokens
 	s.stats.CacheCreation += result.Usage.CacheCreationInputTokens
 	s.stats.Reasoning += result.Usage.ReasoningOutputTokens
+	if result.Usage.Estimated {
+		s.stats.Estimated++
+	}
 	s.stats.LastModel = result.Model
 	s.stats.LastError = ""
 }
@@ -724,6 +729,10 @@ func writeProviderError(w http.ResponseWriter, err error) {
 }
 
 func providerErrorType(err error) string {
+	var httpErr *provider.HTTPError
+	if errors.As(err, &httpErr) && strings.TrimSpace(httpErr.Type) != "" && httpErr.Type != "provider_error" {
+		return httpErr.Type
+	}
 	switch status := provider.Status(err); {
 	case status == http.StatusBadRequest:
 		return "invalid_request_error"
@@ -733,6 +742,8 @@ func providerErrorType(err error) string {
 		return "rate_limit_error"
 	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
 		return "timeout_error"
+	case status == http.StatusRequestEntityTooLarge:
+		return "request_too_large"
 	default:
 		return "api_error"
 	}

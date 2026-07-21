@@ -55,7 +55,10 @@ func TestMain(m *testing.M) {
 			"CLAUDE_CODE_AUTO_MODE_MODEL",
 			"CLAUDE_CODE_BG_CLASSIFIER_MODEL",
 			"CLAUDE_CODE_SUBAGENT_MODEL",
+			"CLAUDE_CODE_AUTO_COMPACT_WINDOW",
 			"CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP",
+			"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+			"CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK",
 			"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
 			"CLAUDE_CODE_USE_GATEWAY",
 			"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
@@ -112,7 +115,7 @@ func TestCodexUsesIsolatedOfficialProfileAndMappedModelCatalog(t *testing.T) {
 		Models:       models,
 		DefaultModel: models[0],
 		ModelDetails: []provider.Model{
-			{ID: models[0], DisplayName: "Primary", Description: "Primary routed model", Default: true, Efforts: []string{"low", "high"}, InputModalities: []string{"text", "image"}, ContextWindow: 128000},
+			{ID: models[0], DisplayName: "Primary", Description: "Primary routed model", Default: true, Efforts: []string{"low", "medium", "high"}, InputModalities: []string{"text", "image"}, ContextWindow: 128000},
 			{ID: models[1], DisplayName: "Secondary", Efforts: []string{"medium"}, InputModalities: []string{"text"}, ContextWindow: 64000},
 		},
 		Args: []string{"exec", "hello"},
@@ -133,7 +136,7 @@ func TestCodexUsesIsolatedOfficialProfileAndMappedModelCatalog(t *testing.T) {
 	joinedArgs := strings.Join(report.Args, "\n")
 	for _, required := range []string{
 		`model="macaz-primary-a1"`, `model_provider="macaz"`,
-		`model_catalog_json=`, `model_reasoning_effort="high"`,
+		`model_catalog_json=`, `model_reasoning_effort="medium"`,
 		`model_providers.macaz.base_url="http://127.0.0.1:54321/v1"`,
 		`model_providers.macaz.wire_api="responses"`, `web_search="disabled"`,
 	} {
@@ -231,12 +234,14 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 	t.Setenv("CLAUDE_CONFIG_DIR", sourceProfile)
 	t.Setenv("MACAZ_FAKE_CLAUDE", "1")
 	t.Setenv("MACAZ_FAKE_CLAUDE_REPORT", reportPath)
+	t.Setenv("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT", "1")
 	cfg := config.Default()
 	cfg.ClaudeExecutable = os.Args[0]
 	if err := Claude(context.Background(), cfg, Options{
 		BaseURL:      "http://127.0.0.1:54321",
 		Token:        "loopback-secret",
 		Models:       []string{"claude-macaz-fake-a1b2c3d4", "claude-macaz-other-e5f6a7b8"},
+		ModelDetails: []provider.Model{{ID: "claude-macaz-fake-a1b2c3d4", ContextWindow: 272000}},
 		DefaultModel: "claude-macaz-fake-a1b2c3d4",
 		Args:         []string{"--model", "sonnet"},
 	}); err != nil {
@@ -278,12 +283,12 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 		"CLAUDE_CODE_AUTO_MODE_MODEL":                "claude-macaz-fake-a1b2c3d4",
 		"CLAUDE_CODE_BG_CLASSIFIER_MODEL":            "claude-macaz-fake-a1b2c3d4",
 		"CLAUDE_CODE_SUBAGENT_MODEL":                 "claude-macaz-fake-a1b2c3d4",
+		"CLAUDE_CODE_AUTO_COMPACT_WINDOW":            "272000",
 		"CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP":     "1",
+		"CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK":  "1",
 		"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK":       "1",
 		"CLAUDE_CODE_USE_GATEWAY":                    "1",
 		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
-		"CLAUDE_CODE_ALWAYS_ENABLE_EFFORT":           "1",
-		"DISABLE_TELEMETRY":                          "1",
 		"DISABLE_ERROR_REPORTING":                    "1",
 		"DISABLE_FEEDBACK_COMMAND":                   "1",
 		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY":        "1",
@@ -293,6 +298,12 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 		if report.Environment[key] != want {
 			t.Fatalf("%s = %q, want %q", key, report.Environment[key], want)
 		}
+	}
+	if report.Environment["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] != "" {
+		t.Fatalf("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT should be unset: %#v", report.Environment)
+	}
+	if report.Environment["DISABLE_TELEMETRY"] != "" || report.Environment["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] != "" {
+		t.Fatalf("feature-flag-disabling environment should be unset: %#v", report.Environment)
 	}
 	for _, key := range []string{
 		"ANTHROPIC_DEFAULT_FABLE_MODEL",
@@ -322,7 +333,7 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 	if settings["enforceAvailableModels"] != true {
 		t.Fatalf("isolated model enforcement = %#v", settings)
 	}
-	if settings["effortLevel"] != "high" {
+	if settings["effortLevel"] != "medium" {
 		t.Fatalf("isolated default effort = %#v", settings)
 	}
 	env, _ := settings["env"].(map[string]any)
@@ -365,7 +376,7 @@ func TestConfiguredEffortUpdatesOnceThenPreservesClaudeSelection(t *testing.T) {
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if settings["effortLevel"] != "high" {
+	if settings["effortLevel"] != "medium" {
 		t.Fatalf("initial effort = %#v", settings)
 	}
 
@@ -387,7 +398,7 @@ func TestConfiguredEffortUpdatesOnceThenPreservesClaudeSelection(t *testing.T) {
 		t.Fatalf("Claude-selected effort was overwritten: %#v", settings)
 	}
 
-	cfg.DefaultEffort = "medium"
+	cfg.DefaultEffort = "high"
 	if _, _, err := prepareClaudeProfile(cfg, models, models[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +409,7 @@ func TestConfiguredEffortUpdatesOnceThenPreservesClaudeSelection(t *testing.T) {
 	if err := json.Unmarshal(raw, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if settings["effortLevel"] != "medium" {
+	if settings["effortLevel"] != "high" {
 		t.Fatalf("updated configured effort was not applied: %#v", settings)
 	}
 }
@@ -414,9 +425,13 @@ func TestClaudePinsInternalModelsWithoutCreatingFamilyAliasRows(t *testing.T) {
 	cfg.ClaudeExecutable = os.Args[0]
 	models := []string{"claude-macaz-sol", "claude-macaz-terra"}
 	if err := Claude(context.Background(), cfg, Options{
-		BaseURL:      "http://127.0.0.1:54321",
-		Token:        "loopback-secret",
-		Models:       models,
+		BaseURL: "http://127.0.0.1:54321",
+		Token:   "loopback-secret",
+		Models:  models,
+		ModelDetails: []provider.Model{
+			{ID: models[0], ContextWindow: 272000},
+			{ID: models[1], ContextWindow: 272000},
+		},
 		DefaultModel: models[0],
 		Args:         []string{"--model", models[1]},
 	}); err != nil {
@@ -450,6 +465,9 @@ func TestClaudePinsInternalModelsWithoutCreatingFamilyAliasRows(t *testing.T) {
 		if report.Environment[key] != models[1] {
 			t.Fatalf("%s = %q, want selected public model", key, report.Environment[key])
 		}
+	}
+	if report.Environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] != "272000" {
+		t.Fatalf("auto compact window = %q", report.Environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
 	}
 	if report.Environment["CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"] != "1" {
 		t.Fatalf(

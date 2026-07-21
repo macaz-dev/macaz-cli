@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,7 +52,9 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 	command.Stdout = firstWriter(options.Stdout, os.Stdout)
 	command.Stderr = firstWriter(options.Stderr, os.Stderr)
 	configureGracefulShutdown(command)
-	command.Env = withEnvironment(os.Environ(), map[string]string{
+	compactWindow := claudeAutoCompactWindow(launchModel, options.ModelDetails)
+	baseEnvironment := withoutEnvironment(os.Environ(), "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT")
+	overrides := map[string]string{
 		"ANTHROPIC_BASE_URL":   options.BaseURL,
 		"ANTHROPIC_AUTH_TOKEN": options.Token,
 		"ANTHROPIC_API_KEY":    options.Token,
@@ -66,18 +69,21 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 		"CLAUDE_CODE_BG_CLASSIFIER_MODEL":            launchModel,
 		"CLAUDE_CODE_SUBAGENT_MODEL":                 launchModel,
 		"CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP":     "1",
+		"CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK":  "1",
 		"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK":       "1",
 		"CLAUDE_CODE_USE_GATEWAY":                    "1",
 		"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
-		"CLAUDE_CODE_ALWAYS_ENABLE_EFFORT":           "1",
-		"DISABLE_TELEMETRY":                          "1",
 		"DISABLE_ERROR_REPORTING":                    "1",
 		"DISABLE_FEEDBACK_COMMAND":                   "1",
 		"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY":        "1",
 		"DO_NOT_TRACK":                               "1",
 		"CLAUDE_CONFIG_DIR":                          profileDir,
 		"MACAZ_ACTIVE":                               "1",
-	})
+	}
+	if compactWindow != "" {
+		overrides["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = compactWindow
+	}
+	command.Env = withEnvironment(baseEnvironment, overrides)
 	defer stopClaudeDaemon(executable, command.Env)
 	defer restoreTerminalAfterClaude(command.Stdin, command.Stdout, command.Stderr)()
 	if err := command.Run(); err != nil {
@@ -87,6 +93,15 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 		return fmt.Errorf("run Claude: %w", err)
 	}
 	return nil
+}
+
+func claudeAutoCompactWindow(selected string, models []provider.Model) string {
+	for _, model := range models {
+		if model.ID == selected && model.ContextWindow > 0 {
+			return strconv.FormatInt(model.ContextWindow, 10)
+		}
+	}
+	return ""
 }
 
 func restoreTerminalAfterClaude(stdin io.Reader, stdout, stderr io.Writer) func() {
@@ -625,6 +640,24 @@ func withEnvironment(current []string, overrides map[string]string) []string {
 	}
 	for key, value := range overrides {
 		result = append(result, key+"="+value)
+	}
+	return result
+}
+
+func withoutEnvironment(current []string, keys ...string) []string {
+	removed := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		removed[key] = true
+	}
+	result := make([]string, 0, len(current))
+	for _, item := range current {
+		key := item
+		if index := strings.IndexByte(item, '='); index >= 0 {
+			key = item[:index]
+		}
+		if !removed[key] {
+			result = append(result, item)
+		}
 	}
 	return result
 }
