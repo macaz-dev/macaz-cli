@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/header.png" alt="Macaz connecting Claude Code and OpenAI Codex" width="100%">
+</p>
+
 # macaz
 
 [![CI](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/macaz-dev/macaz-cli/actions/workflows/ci.yml)
