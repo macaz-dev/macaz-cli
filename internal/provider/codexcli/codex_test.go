@@ -419,14 +419,16 @@ func TestPrepareDirectModelCatalogOverridesAgentRuntimeSelectors(t *testing.T) {
 	if !bytes.Contains(unchanged, []byte(`"tool_mode":"code_mode_only"`)) {
 		t.Fatalf("source catalog was modified: %s", unchanged)
 	}
-	if joined := strings.Join(appServerArgsWithCatalog(path), "\n"); !strings.Contains(joined, "model_catalog_json=") || !strings.Contains(joined, path) {
-		t.Fatalf("catalog override args = %s", joined)
+	wantCatalogArg := fmt.Sprintf("model_catalog_json=%q", path)
+	if joined := strings.Join(appServerArgsWithCatalog(path), "\n"); !strings.Contains(joined, wantCatalogArg) {
+		t.Fatalf("catalog override args = %s, want %s", joined, wantCatalogArg)
 	}
 }
 
 func TestCodexHomeFromVersionOutput(t *testing.T) {
-	output := []byte("Using work profile\nCODEX_HOME=/tmp/codex-work\ncodex-cli 0.144.6\n")
-	if got := codexHomeFromVersionOutput(output); got != "/tmp/codex-work" {
+	home := t.TempDir()
+	output := []byte("Using work profile\nCODEX_HOME=" + home + "\ncodex-cli 0.144.6\n")
+	if got := codexHomeFromVersionOutput(output); got != filepath.Clean(home) {
 		t.Fatalf("reported CODEX_HOME = %q", got)
 	}
 	if got := codexHomeFromVersionOutput([]byte("CODEX_HOME=relative/path\n")); got != "" {
