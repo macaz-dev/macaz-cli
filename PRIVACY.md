@@ -30,6 +30,13 @@ directory. API keys and OpenAI authorization credentials are stored in the
 operating-system credential store when available. Environment-variable
 credentials remain process-level overrides.
 
+When local agent auth is selected, macaz reads the chosen credential from a
+Codex, OpenCode, or Pi `auth.json` instead of copying it into `config.json` or
+the operating-system credential store. For OAuth credentials, macaz may update
+that entry when OpenAI rotates the access or refresh token. Updates use the
+source agent's compatible file lock where available and reject stale refresh
+token writes. Resetting macaz does not remove credentials owned by those agents.
+
 Claude Code and Codex CLI use separate isolated profiles created for macaz.
 Those profiles can contain client-owned conversation transcripts and other
 client state. The Codex profile may link to user-managed skills, plugins,

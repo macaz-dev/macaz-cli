@@ -175,7 +175,11 @@ func prepareClaudeProfile(cfg config.Config, models []string, defaultModel strin
 		return "", "", err
 	}
 	scrubGatewaySettings(settings)
-	providerChanged, err := profileProviderChanged(profileDir, cfg.Provider)
+	providerIdentity := cfg.Provider
+	if cfg.Provider == config.ProviderLocalAgentsAuth {
+		providerIdentity += ":" + cfg.LocalAuthAgent + ":" + cfg.LocalAuthProvider + ":" + cfg.LocalAuthPath
+	}
+	providerChanged, err := profileProviderChanged(profileDir, providerIdentity)
 	if err != nil {
 		return "", "", err
 	}
@@ -208,7 +212,7 @@ func prepareClaudeProfile(cfg config.Config, models []string, defaultModel strin
 			return "", "", err
 		}
 	}
-	if err := writeProfileProvider(profileDir, cfg.Provider); err != nil {
+	if err := writeProfileProvider(profileDir, providerIdentity); err != nil {
 		return "", "", err
 	}
 	if err := migrateLegacyGatewaySessions(sourceDir, profileDir); err != nil {

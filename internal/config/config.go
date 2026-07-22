@@ -20,6 +20,8 @@ const (
 	ProviderAnthropicAPI       = "anthropic-api"
 	ProviderCodexCLI           = "codex-cli"
 	ProviderOpenCodeCLI        = "opencode-cli"
+	ProviderLocalAgentsAuth    = "local-agents-auth"
+	ProviderManualOpenAI       = "manual-openai-compatible"
 )
 
 type ClientProfile struct {
@@ -31,6 +33,9 @@ type ClientProfile struct {
 	AnthropicBaseURL  string            `json:"anthropic_base_url,omitempty"`
 	AnthropicModel    string            `json:"anthropic_model,omitempty"`
 	OpenCodeModel     string            `json:"opencode_model,omitempty"`
+	LocalAuthAgent    string            `json:"local_auth_agent,omitempty"`
+	LocalAuthProvider string            `json:"local_auth_provider,omitempty"`
+	LocalAuthPath     string            `json:"local_auth_path,omitempty"`
 	DefaultEffort     string            `json:"default_effort,omitempty"`
 	ModelMap          map[string]string `json:"model_map,omitempty"`
 }
@@ -51,6 +56,9 @@ type Config struct {
 	AnthropicBaseURL          string                   `json:"anthropic_base_url,omitempty"`
 	AnthropicModel            string                   `json:"anthropic_model,omitempty"`
 	OpenCodeModel             string                   `json:"opencode_model,omitempty"`
+	LocalAuthAgent            string                   `json:"local_auth_agent,omitempty"`
+	LocalAuthProvider         string                   `json:"local_auth_provider,omitempty"`
+	LocalAuthPath             string                   `json:"local_auth_path,omitempty"`
 	DefaultEffort             string                   `json:"default_effort,omitempty"`
 	ModelMap                  map[string]string        `json:"model_map,omitempty"`
 	RequestTimeoutSec         int                      `json:"request_timeout_seconds,omitempty"`
@@ -316,6 +324,14 @@ func (c Config) Validate() error {
 		if err := validateClientProvider(client, profile.Provider); err != nil {
 			return err
 		}
+		if profile.Provider == ProviderLocalAgentsAuth &&
+			(strings.TrimSpace(profile.LocalAuthAgent) == "" || strings.TrimSpace(profile.LocalAuthProvider) == "" || strings.TrimSpace(profile.LocalAuthPath) == "") {
+			return fmt.Errorf("%s client: local agent authentication source is incomplete", client)
+		}
+	}
+	if c.Provider == ProviderLocalAgentsAuth &&
+		(strings.TrimSpace(c.LocalAuthAgent) == "" || strings.TrimSpace(c.LocalAuthProvider) == "" || strings.TrimSpace(c.LocalAuthPath) == "") {
+		return errors.New("local agent authentication source is incomplete")
 	}
 	switch c.DefaultEffort {
 	case "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
@@ -361,7 +377,7 @@ func ValidateClient(client string) error {
 
 func validateProvider(name string) error {
 	switch name {
-	case "", ProviderOpenAISubscription, ProviderOpenAIAPIKey, ProviderOpenRouterAPI, ProviderAnthropicAPI, ProviderCodexCLI, ProviderOpenCodeCLI:
+	case "", ProviderOpenAISubscription, ProviderOpenAIAPIKey, ProviderOpenRouterAPI, ProviderAnthropicAPI, ProviderCodexCLI, ProviderOpenCodeCLI, ProviderLocalAgentsAuth, ProviderManualOpenAI:
 		return nil
 	default:
 		return fmt.Errorf("unsupported provider %q", name)
@@ -401,6 +417,9 @@ func (c Config) ForClient(client string) (Config, error) {
 	result.AnthropicBaseURL = firstNonEmpty(profile.AnthropicBaseURL, Default().AnthropicBaseURL)
 	result.AnthropicModel = profile.AnthropicModel
 	result.OpenCodeModel = profile.OpenCodeModel
+	result.LocalAuthAgent = profile.LocalAuthAgent
+	result.LocalAuthProvider = profile.LocalAuthProvider
+	result.LocalAuthPath = profile.LocalAuthPath
 	result.DefaultEffort = firstNonEmpty(profile.DefaultEffort, Default().DefaultEffort)
 	if profile.ModelMap != nil {
 		result.ModelMap = cloneStringMap(profile.ModelMap)
@@ -427,6 +446,9 @@ func (c *Config) SetClient(client string, selected Config) {
 		AnthropicBaseURL:  selected.AnthropicBaseURL,
 		AnthropicModel:    selected.AnthropicModel,
 		OpenCodeModel:     selected.OpenCodeModel,
+		LocalAuthAgent:    selected.LocalAuthAgent,
+		LocalAuthProvider: selected.LocalAuthProvider,
+		LocalAuthPath:     selected.LocalAuthPath,
 		DefaultEffort:     selected.DefaultEffort,
 		ModelMap:          cloneStringMap(selected.ModelMap),
 	}
