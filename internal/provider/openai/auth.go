@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/macaz-dev/macaz-cli/internal/localagentsauth"
 	"github.com/macaz-dev/macaz-cli/internal/secrets"
 )
 
@@ -44,6 +45,7 @@ type DeviceAuthorization struct {
 type accountAuth struct {
 	httpClient *http.Client
 	mu         sync.Mutex
+	local      *localagentsauth.Source
 }
 
 type accountCredentials struct {
@@ -53,6 +55,7 @@ type accountCredentials struct {
 	Refresh   string `json:"refresh"`
 	ExpiresAt int64  `json:"expires_at"`
 	AccountID string `json:"account_id,omitempty"`
+	IDToken   string `json:"id_token,omitempty"`
 }
 
 type accountTokenResponse struct {
@@ -70,6 +73,10 @@ type pendingAuthorization struct {
 
 func newAccountAuth(client *http.Client) *accountAuth {
 	return &accountAuth{httpClient: client}
+}
+
+func newLocalAccountAuth(client *http.Client, source localagentsauth.Source) *accountAuth {
+	return &accountAuth{httpClient: client, local: &source}
 }
 
 func AuthorizeSubscription(ctx context.Context, client *http.Client, ready func(DeviceAuthorization) error) error {
@@ -192,13 +199,22 @@ func (a *accountAuth) poll(ctx context.Context, pending pendingAuthorization) (a
 func (a *accountAuth) credentials(ctx context.Context) (accountCredentials, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	raw, err := secrets.Get(secrets.OpenAIAccount, "")
-	if err != nil {
-		return accountCredentials{}, fmt.Errorf("OpenAI Subscription is not connected: %w", err)
+	if a.local != nil {
+		var result accountCredentials
+		err := localagentsauth.WithLock(*a.local, func() error {
+			var err error
+			result, err = a.credentialsLocked(ctx)
+			return err
+		})
+		return result, err
 	}
-	var credential accountCredentials
-	if err := json.Unmarshal([]byte(raw), &credential); err != nil {
-		return accountCredentials{}, fmt.Errorf("decode OpenAI Subscription credential: %w", err)
+	return a.credentialsLocked(ctx)
+}
+
+func (a *accountAuth) credentialsLocked(ctx context.Context) (accountCredentials, error) {
+	credential, err := a.loadCredential()
+	if err != nil {
+		return accountCredentials{}, err
 	}
 	if credential.Type != accountCredentialType {
 		return accountCredentials{}, errors.New("stored credential is not an OpenAI Subscription credential")
@@ -217,10 +233,7 @@ func (a *accountAuth) credentials(ctx context.Context) (accountCredentials, erro
 		tokens.RefreshToken = credential.Refresh
 	}
 	next := credentialFromTokens(tokens, credential.AccountID)
-	if err := saveAccountCredential(next); err != nil {
-		return accountCredentials{}, err
-	}
-	return next, nil
+	return a.saveCredential(next, credential.Refresh)
 }
 
 // forceRefresh replaces a token rejected by the upstream even when its local
@@ -229,13 +242,22 @@ func (a *accountAuth) credentials(ctx context.Context) (accountCredentials, erro
 func (a *accountAuth) forceRefresh(ctx context.Context, rejectedAccess string) (accountCredentials, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	raw, err := secrets.Get(secrets.OpenAIAccount, "")
-	if err != nil {
-		return accountCredentials{}, fmt.Errorf("OpenAI Subscription is not connected: %w", err)
+	if a.local != nil {
+		var result accountCredentials
+		err := localagentsauth.WithLock(*a.local, func() error {
+			var err error
+			result, err = a.forceRefreshLocked(ctx, rejectedAccess)
+			return err
+		})
+		return result, err
 	}
-	var credential accountCredentials
-	if err := json.Unmarshal([]byte(raw), &credential); err != nil {
-		return accountCredentials{}, fmt.Errorf("decode OpenAI Subscription credential: %w", err)
+	return a.forceRefreshLocked(ctx, rejectedAccess)
+}
+
+func (a *accountAuth) forceRefreshLocked(ctx context.Context, rejectedAccess string) (accountCredentials, error) {
+	credential, err := a.loadCredential()
+	if err != nil {
+		return accountCredentials{}, err
 	}
 	if credential.Type != accountCredentialType {
 		return accountCredentials{}, errors.New("stored credential is not an OpenAI Subscription credential")
@@ -254,10 +276,49 @@ func (a *accountAuth) forceRefresh(ctx context.Context, rejectedAccess string) (
 		tokens.RefreshToken = credential.Refresh
 	}
 	next := credentialFromTokens(tokens, credential.AccountID)
-	if err := saveAccountCredential(next); err != nil {
+	return a.saveCredential(next, credential.Refresh)
+}
+
+func (a *accountAuth) loadCredential() (accountCredentials, error) {
+	if a.local != nil {
+		credential, err := localagentsauth.Get(a.local.Agent, a.local.Provider, a.local.Path)
+		if err != nil {
+			return accountCredentials{}, err
+		}
+		if credential.Type != "oauth" {
+			return accountCredentials{}, errors.New("local OpenAI credential is not OAuth")
+		}
+		return accountCredentials{
+			Type: accountCredentialType, Access: credential.Access, Refresh: credential.Refresh,
+			ExpiresAt: credential.Expires, AccountID: credential.AccountID, IDToken: credential.IDToken,
+		}, nil
+	}
+	raw, err := secrets.Get(secrets.OpenAIAccount, "")
+	if err != nil {
+		return accountCredentials{}, fmt.Errorf("OpenAI Subscription is not connected: %w", err)
+	}
+	var credential accountCredentials
+	if err := json.Unmarshal([]byte(raw), &credential); err != nil {
+		return accountCredentials{}, fmt.Errorf("decode OpenAI Subscription credential: %w", err)
+	}
+	return credential, nil
+}
+
+func (a *accountAuth) saveCredential(credential accountCredentials, expectedRefresh string) (accountCredentials, error) {
+	if a.local != nil {
+		updated, err := localagentsauth.UpdateOAuth(*a.local, expectedRefresh, credential.Access, credential.Refresh, credential.ExpiresAt, credential.AccountID, credential.IDToken)
+		if err != nil {
+			return accountCredentials{}, err
+		}
+		if !updated {
+			return a.loadCredential()
+		}
+		return credential, nil
+	}
+	if err := saveAccountCredential(credential); err != nil {
 		return accountCredentials{}, err
 	}
-	return next, nil
+	return credential, nil
 }
 
 func (a *accountAuth) exchange(ctx context.Context, code, verifier string) (accountTokenResponse, error) {
@@ -334,6 +395,7 @@ func credentialFromTokens(tokens accountTokenResponse, fallbackAccountID string)
 		Refresh:   tokens.RefreshToken,
 		ExpiresAt: time.Now().Add(time.Duration(expiresIn) * time.Second).UnixMilli(),
 		AccountID: accountID,
+		IDToken:   tokens.IDToken,
 	}
 }
 

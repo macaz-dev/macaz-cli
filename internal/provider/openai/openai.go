@@ -18,6 +18,7 @@ import (
 
 	"github.com/macaz-dev/macaz-cli/internal/attachments"
 	"github.com/macaz-dev/macaz-cli/internal/config"
+	"github.com/macaz-dev/macaz-cli/internal/localagentsauth"
 	"github.com/macaz-dev/macaz-cli/internal/protocol"
 	"github.com/macaz-dev/macaz-cli/internal/provider"
 	"github.com/macaz-dev/macaz-cli/internal/provider/openresponses"
@@ -29,6 +30,9 @@ type Mode string
 const (
 	ModeAPIKey            Mode = "api-key"
 	ModeSubscription      Mode = "subscription"
+	ModeLocalAPIKey       Mode = "local-api-key"
+	ModeLocalOAuth        Mode = "local-oauth"
+	ModeCompatible        Mode = "openai-compatible"
 	modelsDevURL               = "https://models.dev/api.json"
 	responseHeaderTimeout      = 60 * time.Second
 	responseIdleTimeout        = 5 * time.Minute
@@ -46,6 +50,7 @@ type Provider struct {
 	modelMu           sync.Mutex
 	models            []provider.Model
 	modelsAt          time.Time
+	localSource       localagentsauth.Source
 }
 
 type generateGate struct {
@@ -68,8 +73,10 @@ func New(mode Mode, cfg config.Config) (*Provider, error) {
 		httpClient: client,
 		retryBase:  time.Second,
 	}
-	if mode == ModeSubscription {
-		p.account = newAccountAuth(client)
+	if p.subscription() {
+		if mode != ModeLocalOAuth {
+			p.account = newAccountAuth(client)
+		}
 		// Keep turns ordered within one Claude session/agent and bound aggregate
 		// account fan-out so a burst of subagents cannot exhaust a subscription.
 		p.subscriptionGates = make(map[string]*generateGate)
@@ -82,18 +89,63 @@ func New(mode Mode, cfg config.Config) (*Provider, error) {
 	return p, nil
 }
 
+func NewLocalAgentsAuth(cfg config.Config) (*Provider, error) {
+	selected := localagentsauth.Source{Agent: cfg.LocalAuthAgent, Provider: cfg.LocalAuthProvider, Path: cfg.LocalAuthPath}
+	var credential localagentsauth.Source
+	err := localagentsauth.WithLock(selected, func() error {
+		var loadErr error
+		credential, loadErr = localagentsauth.Get(selected.Agent, selected.Provider, selected.Path)
+		return loadErr
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !localOpenAIAdapter(credential) {
+		return nil, fmt.Errorf("local auth adapter for %s/%s is not implemented", credential.Agent, credential.Provider)
+	}
+	var mode Mode
+	switch credential.Type {
+	case "oauth":
+		mode = ModeLocalOAuth
+	case "api":
+		mode = ModeLocalAPIKey
+	default:
+		return nil, fmt.Errorf("local credential %s/%s has unsupported type %q", credential.Agent, credential.Provider, credential.Type)
+	}
+	p, err := New(mode, cfg)
+	if err != nil {
+		return nil, err
+	}
+	p.localSource = credential
+	if mode == ModeLocalOAuth {
+		p.account = newLocalAccountAuth(p.httpClient, credential)
+	}
+	return p, nil
+}
+
 func (p *Provider) Name() string {
-	if p.mode == ModeSubscription {
+	if p.subscription() {
+		if p.mode == ModeLocalOAuth {
+			return "OpenAI Subscription / " + p.localSource.Agent + " auth"
+		}
 		return "OpenAI Subscription"
+	}
+	if p.mode == ModeLocalAPIKey {
+		return "OpenAI API / " + p.localSource.Agent + " auth"
+	}
+	if p.mode == ModeCompatible {
+		return "OpenAI-compatible endpoint"
 	}
 	return "OpenAI API"
 }
 
 func (p *Provider) Check(ctx context.Context) error {
 	switch p.mode {
-	case ModeAPIKey:
-		if _, err := secrets.Get(secrets.OpenAIAPIKey, "OPENAI_API_KEY"); err != nil {
-			return err
+	case ModeAPIKey, ModeLocalAPIKey, ModeCompatible:
+		if p.mode != ModeCompatible {
+			if _, err := p.apiKey(); err != nil {
+				return err
+			}
 		}
 		models, err := p.Models(ctx)
 		if err != nil {
@@ -106,7 +158,7 @@ func (p *Provider) Check(ctx context.Context) error {
 			}
 		}
 		return fmt.Errorf("configured OpenAI model %q is unavailable or is not a Responses-compatible text model with tool calling", selected)
-	case ModeSubscription:
+	case ModeSubscription, ModeLocalOAuth:
 		models, err := p.Models(ctx)
 		if err != nil {
 			return err
@@ -130,7 +182,7 @@ func (p *Provider) Models(ctx context.Context) ([]provider.Model, error) {
 		models []provider.Model
 		err    error
 	)
-	if p.mode == ModeSubscription {
+	if p.subscription() {
 		models, err = p.subscriptionModels(ctx)
 	} else {
 		models, err = p.apiModels(ctx)
@@ -462,7 +514,7 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		return protocol.Result{}, provider.InvalidRequest(err)
 	}
 	translated.Body["stream"] = true
-	if p.mode == ModeSubscription {
+	if p.subscription() {
 		if err := normalizeSubscriptionDocuments(ctx, translated.Body, p.cfg.MaxBodyBytes); err != nil {
 			return protocol.Result{}, provider.InvalidRequest(err)
 		}
@@ -557,7 +609,7 @@ func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*ht
 	// amplify one rate limit into dozens of hidden upstream requests.
 	const subscriptionAttempts = 3
 	attempts := 1
-	if p.mode == ModeSubscription {
+	if p.subscription() {
 		attempts = subscriptionAttempts
 	}
 	var lastRetry time.Duration
@@ -587,7 +639,7 @@ func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*ht
 		usedAccess := strings.TrimPrefix(httpReq.Header.Get("Authorization"), "Bearer ")
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		_ = resp.Body.Close()
-		if p.mode == ModeSubscription && resp.StatusCode == http.StatusUnauthorized && !authRefreshed && attempt+1 < attempts {
+		if p.subscription() && resp.StatusCode == http.StatusUnauthorized && !authRefreshed && attempt+1 < attempts {
 			authRefreshed = true
 			if _, err := p.account.forceRefresh(ctx, usedAccess); err != nil {
 				return nil, err
@@ -595,7 +647,7 @@ func (p *Provider) sendResponsesWithRetry(ctx context.Context, body []byte) (*ht
 			continue
 		}
 		lastRetry = responseRetryDelay(resp.Header, attempt, p.retryBase)
-		if p.mode == ModeSubscription && retryableSubscriptionStatus(resp.StatusCode) && attempt+1 < attempts {
+		if p.subscription() && retryableSubscriptionStatus(resp.StatusCode) && attempt+1 < attempts {
 			timer := time.NewTimer(lastRetry)
 			select {
 			case <-ctx.Done():
@@ -655,7 +707,7 @@ func responseRetryDelay(header http.Header, attempt int, base time.Duration) tim
 }
 
 func (p *Provider) CountTokens(ctx context.Context, req *protocol.Request) (int, bool, error) {
-	if p.mode == ModeSubscription {
+	if p.subscription() || p.mode == ModeCompatible {
 		return protocol.EstimateInputTokens(req), true, nil
 	}
 	model := p.cfg.ResolveModel(req.Model)
@@ -703,7 +755,7 @@ func (p *Provider) CountTokens(ctx context.Context, req *protocol.Request) (int,
 }
 
 func (p *Provider) endpoint(path string) string {
-	if p.mode == ModeSubscription {
+	if p.subscription() {
 		return accountResponsesEndpoint
 	}
 	base := strings.TrimRight(p.cfg.OpenAIBaseURL, "/")
@@ -711,8 +763,11 @@ func (p *Provider) endpoint(path string) string {
 }
 
 func (p *Provider) authorize(ctx context.Context, req *http.Request) error {
-	if p.mode == ModeAPIKey {
-		key, err := secrets.Get(secrets.OpenAIAPIKey, "OPENAI_API_KEY")
+	if !p.subscription() {
+		if p.mode == ModeCompatible {
+			return nil
+		}
+		key, err := p.apiKey()
 		if err != nil {
 			return err
 		}
@@ -731,6 +786,34 @@ func (p *Provider) authorize(ctx context.Context, req *http.Request) error {
 		req.Header.Set("ChatGPT-Account-Id", creds.AccountID)
 	}
 	return nil
+}
+
+func (p *Provider) subscription() bool {
+	return p.mode == ModeSubscription || p.mode == ModeLocalOAuth
+}
+
+func (p *Provider) apiKey() (string, error) {
+	if p.mode != ModeLocalAPIKey {
+		return secrets.Get(secrets.OpenAIAPIKey, "OPENAI_API_KEY")
+	}
+	selected := localagentsauth.Source{Agent: p.cfg.LocalAuthAgent, Provider: p.cfg.LocalAuthProvider, Path: p.cfg.LocalAuthPath}
+	var credential localagentsauth.Source
+	err := localagentsauth.WithLock(selected, func() error {
+		var loadErr error
+		credential, loadErr = localagentsauth.Get(selected.Agent, selected.Provider, selected.Path)
+		return loadErr
+	})
+	if err != nil {
+		return "", err
+	}
+	if credential.Type != "api" || strings.TrimSpace(credential.Key) == "" {
+		return "", fmt.Errorf("local credential %s/%s is not a usable API key", credential.Agent, credential.Provider)
+	}
+	return strings.TrimSpace(credential.Key), nil
+}
+
+func localOpenAIAdapter(source localagentsauth.Source) bool {
+	return source.Provider == "openai" || source.Agent == "pi" && source.Provider == "openai-codex"
 }
 
 func containsString(values []string, target string) bool {

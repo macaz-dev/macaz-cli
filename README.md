@@ -105,7 +105,9 @@ export MACAZ_NO_UPDATE_CHECK=1
 - Go is needed only when building from source.
 - `claude` must be on `PATH` to use `macaz claude`.
 - `codex` must be on `PATH` to use `macaz codex`.
-- `opencode` is required only when OpenCode CLI is the selected provider.
+- `opencode` is required only when OpenCode CLI is the selected provider. Local
+  agent auth reads existing Codex, OpenCode, or Pi credentials directly and
+  does not start those CLIs.
 - A browser is used by the OpenAI Subscription authorization flow.
 
 Claude Code, Codex CLI, and OpenCode are not bundled or redistributed.
@@ -129,12 +131,26 @@ Available upstreams:
 | Anthropic API | no (use Claude directly) | yes |
 | Codex CLI provider bridge (experimental) | yes | no (recursive) |
 | OpenCode CLI provider bridge (experimental) | yes | yes |
+| Local agent auth direct adapter (Codex/OpenCode/Pi, experimental) | yes | yes |
+| Manual OpenAI-compatible endpoint | yes | yes |
 
-API keys and OAuth credentials are stored in the operating-system credential
-store, not in `config.json`. The Anthropic option uses an Anthropic API key and
+API keys and OAuth credentials configured by macaz are stored in the
+operating-system credential store, not in `config.json`. Local agent auth
+instead uses a selected credential from Codex's, OpenCode's, or Pi's
+`auth.json`. Supported discoveries are appended directly to the provider menu
+and identify both the source agent and whether the credential is an API key or
+a subscription. The initial direct adapter supports OpenAI OAuth and API-key
+entries. OAuth refreshes are written back to that same file under the source's
+compatible lock where one exists, with stale-token conflict detection so the
+source agent and macaz keep one credential source. The Anthropic option uses an Anthropic API key and
 the public Messages API; it does not use or convert a Claude consumer
 subscription. Anthropic model IDs, token limits, input capabilities, and effort
 levels are read from the account's live Models API during setup and startup.
+
+`Manual provider` accepts either an OpenAI-compatible base URL (including its
+port) plus a model ID, or an explicit path to a nonstandard Codex, OpenCode, or
+Pi `auth.json`. A base URL without a path is normalized to `/v1`. Manual local
+endpoints do not require or send an API key.
 
 Each start refreshes the active provider catalog. The resulting public model
 IDs and supported reasoning levels are written to the isolated client profile,
@@ -221,6 +237,9 @@ The isolated profiles may contain client-owned session history. See
   using this experimental bridge.
 - OpenCode CLI uses an isolated request-scoped provider configuration. Its
   project tools and context are not exposed as a second agent layer.
+- Local agent auth bypasses the source agent runtime and uses a selected Codex,
+  OpenCode, or Pi credential. The OpenAI adapter follows the same direct API and
+  subscription paths as macaz's native OpenAI providers.
 - Claude Code controls skill and subagent fan-out. Parallel subagents and Auto
   mode classifier checks can consume substantially more provider usage than a
   single-agent Codex session. Macaz keeps the user's selected model for main,

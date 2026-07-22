@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,183 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestLocalAgentAuthUsesOAuthAndAPIKeyCredentials(t *testing.T) {
+	tests := []struct {
+		name        string
+		credential  string
+		wantMode    Mode
+		wantAccount string
+	}{
+		{
+			name:        "oauth",
+			credential:  `{"type":"oauth","access":"oauth-access","refresh":"oauth-refresh","expires":4102444800000,"accountId":"acct-test"}`,
+			wantMode:    ModeLocalOAuth,
+			wantAccount: "acct-test",
+		},
+		{
+			name:       "api key",
+			credential: `{"type":"api","key":"api-key-value"}`,
+			wantMode:   ModeLocalAPIKey,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dataHome := t.TempDir()
+			t.Setenv("XDG_DATA_HOME", dataHome)
+			dir := filepath.Join(dataHome, "opencode")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{"openai":`+test.credential+`}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Default()
+			cfg.Provider = config.ProviderLocalAgentsAuth
+			cfg.LocalAuthAgent = "opencode"
+			cfg.LocalAuthProvider = "openai"
+			cfg.LocalAuthPath = filepath.Join(dir, "auth.json")
+			upstream, err := NewLocalAgentsAuth(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if upstream.mode != test.wantMode {
+				t.Fatalf("mode = %q, want %q", upstream.mode, test.wantMode)
+			}
+			req := httptest.NewRequest(http.MethodGet, "https://example.test", nil)
+			if err := upstream.authorize(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			wantAuthorization := "Bearer api-key-value"
+			if test.wantMode == ModeLocalOAuth {
+				wantAuthorization = "Bearer oauth-access"
+			}
+			if req.Header.Get("Authorization") != wantAuthorization || req.Header.Get("ChatGPT-Account-Id") != test.wantAccount {
+				t.Fatalf("authorization headers = %#v", req.Header)
+			}
+		})
+	}
+}
+
+func TestLocalAgentOAuthSchemasUseSubscriptionAdapter(t *testing.T) {
+	expiresPayload := base64.RawURLEncoding.EncodeToString([]byte(`{"exp":4102444800}`))
+	tests := []struct {
+		agent    string
+		provider string
+		content  string
+	}{
+		{
+			agent: "pi", provider: "openai-codex",
+			content: `{"openai-codex":{"type":"oauth","access":"pi-access","refresh":"pi-refresh","expires":4102444800000,"accountId":"pi-account"}}`,
+		},
+		{
+			agent: "codex", provider: "openai",
+			content: `{"auth_mode":"chatgpt","tokens":{"id_token":"id","access_token":"x.` + expiresPayload + `.x","refresh_token":"codex-refresh","account_id":"codex-account"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.agent, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.json")
+			if err := os.WriteFile(path, []byte(test.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Default()
+			cfg.Provider = config.ProviderLocalAgentsAuth
+			cfg.LocalAuthAgent = test.agent
+			cfg.LocalAuthProvider = test.provider
+			cfg.LocalAuthPath = path
+			upstream, err := NewLocalAgentsAuth(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if upstream.mode != ModeLocalOAuth || !upstream.subscription() {
+				t.Fatalf("provider mode = %q", upstream.mode)
+			}
+			req := httptest.NewRequest(http.MethodGet, "https://example.test", nil)
+			if err := upstream.authorize(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(req.Header.Get("Authorization"), "Bearer ") || req.Header.Get("ChatGPT-Account-Id") == "" {
+				t.Fatalf("authorization headers = %#v", req.Header)
+			}
+		})
+	}
+}
+
+func TestCompatibleEndpointDoesNotRequireAPIKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v1/models" {
+			t.Fatalf("path = %s", req.URL.Path)
+		}
+		if req.Header.Get("Authorization") != "" {
+			t.Fatalf("unexpected authorization header %q", req.Header.Get("Authorization"))
+		}
+		_, _ = io.WriteString(w, `{"data":[{"id":"local-model","created":1}]}`)
+	}))
+	defer server.Close()
+	cfg := config.Default()
+	cfg.Provider = config.ProviderManualOpenAI
+	cfg.OpenAIBaseURL = server.URL + "/v1"
+	cfg.OpenAIModel = "local-model"
+	cfg.ModelMap = map[string]string{"default": "local-model"}
+	upstream, err := New(ModeCompatible, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upstream.Check(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	count, estimated, err := upstream.CountTokens(context.Background(), &protocol.Request{})
+	if err != nil || !estimated || count < 1 {
+		t.Fatalf("token count = %d, estimated=%t, err=%v", count, estimated, err)
+	}
+}
+
+func TestLocalOAuthRefreshUpdatesSharedCredential(t *testing.T) {
+	dataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	dir := filepath.Join(dataHome, "opencode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte(`{"openai":{"type":"oauth","access":"expired","refresh":"old-refresh","expires":1,"accountId":"acct","custom":"keep"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.LocalAuthAgent = "opencode"
+	cfg.LocalAuthProvider = "openai"
+	cfg.LocalAuthPath = path
+	upstream, err := NewLocalAgentsAuth(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != accountTokenEndpoint {
+			t.Fatalf("refresh URL = %s", req.URL)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}`)),
+			Request:    req,
+		}, nil
+	})
+	credential, err := upstream.account.credentials(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credential.Access != "fresh-access" || credential.Refresh != "fresh-refresh" || credential.AccountID != "acct" {
+		t.Fatalf("refreshed credential = %#v", credential)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"access": "fresh-access"`)) || !bytes.Contains(raw, []byte(`"custom": "keep"`)) {
+		t.Fatalf("updated auth.json = %s", raw)
+	}
 }
 
 type contextReadCloser struct {

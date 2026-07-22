@@ -202,17 +202,22 @@ func TestWizardOnlyOffersUsefulProvidersForEachClient(t *testing.T) {
 	}{
 		{
 			client:  config.ClientClaude,
-			present: []string{"OpenAI Subscription", "OpenAI API", "OpenRouter API", "Codex-CLI (experimental)", "OpenCode-CLI (experimental)"},
+			present: []string{"OpenAI Subscription", "OpenAI API", "OpenRouter API", "Codex-CLI (experimental)", "OpenCode-CLI (experimental)", "Manual provider"},
 			absent:  []string{"Anthropic API"},
 		},
 		{
 			client:  config.ClientCodex,
-			present: []string{"OpenRouter API", "Anthropic API", "OpenCode-CLI (experimental)"},
+			present: []string{"OpenRouter API", "Anthropic API", "OpenCode-CLI (experimental)", "Manual provider"},
 			absent:  []string{"OpenAI Subscription", "OpenAI API", "Codex-CLI"},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.client, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+			t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, "pi"))
+			t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
 			var output bytes.Buffer
 			_, _ = wizard(context.Background(), test.client, config.Default(), Streams{
 				In: strings.NewReader("invalid\n"), Out: &output, Err: &output,
@@ -229,6 +234,99 @@ func TestWizardOnlyOffersUsefulProvidersForEachClient(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWizardAddsDiscoveredLocalAgentProviders(t *testing.T) {
+	home := t.TempDir()
+	dataHome := filepath.Join(home, "data")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, "pi"))
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+	dir := filepath.Join(dataHome, "opencode")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(`{
+  "github-copilot":{"type":"oauth","access":"x","refresh":"y","expires":1},
+  "openai":{"type":"api","key":"test-key"}
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	piDir := filepath.Join(home, "pi")
+	if err := os.MkdirAll(piDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(piDir, "auth.json"), []byte(`{"openai-codex":{"type":"oauth","access":"x","refresh":"y","expires":1,"accountId":"acct"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	codexDir := filepath.Join(home, "codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"x","refresh_token":"y","account_id":"acct"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	selected, err := wizard(context.Background(), config.ClientClaude, config.Default(), Streams{
+		In: strings.NewReader("9\n"), Out: &output, Err: &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selected.Provider != config.ProviderLocalAgentsAuth || selected.LocalAuthAgent != "pi" || selected.LocalAuthProvider != "openai-codex" || selected.LocalAuthPath != filepath.Join(piDir, "auth.json") {
+		t.Fatalf("selected config = %#v", selected)
+	}
+	for _, value := range []string{"1. OpenAI Subscription (connect account)", "6. Manual provider", "Already authenticated providers (reuse existing credentials):", "7. OpenAI Subscription (Codex auth)", "8. OpenAI API key (OpenCode auth)", "9. OpenAI Subscription (Pi auth)", "Provider [1-9]"} {
+		if !strings.Contains(output.String(), value) {
+			t.Fatalf("wizard output is missing %q: %s", value, output.String())
+		}
+	}
+}
+
+func TestManualProviderSupportsEndpointAndCustomAuthPath(t *testing.T) {
+	t.Run("endpoint", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+		t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, "pi"))
+		t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+		var output bytes.Buffer
+		selected, err := wizard(context.Background(), config.ClientClaude, config.Default(), Streams{
+			In: strings.NewReader("6\n1\nhttp://localhost:11434\nllama-test\n"), Out: &output, Err: &output,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if selected.Provider != config.ProviderManualOpenAI || selected.OpenAIBaseURL != "http://localhost:11434/v1" || selected.ResolveModel("default") != "llama-test" {
+			t.Fatalf("selected config = %#v", selected)
+		}
+	})
+
+	t.Run("custom auth path", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+		t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, "pi"))
+		t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
+		path := filepath.Join(home, "profiles", "work", "auth.json")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"access","refresh_token":"refresh","account_id":"acct"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var output bytes.Buffer
+		selected, err := wizard(context.Background(), config.ClientClaude, config.Default(), Streams{
+			In: strings.NewReader("6\n2\n" + path + "\n"), Out: &output, Err: &output,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if selected.Provider != config.ProviderLocalAgentsAuth || selected.LocalAuthAgent != "codex" || selected.LocalAuthPath != path {
+			t.Fatalf("selected config = %#v", selected)
+		}
+	})
 }
 
 func TestAnthropicWizardSelectsDefaultFromLiveCatalog(t *testing.T) {

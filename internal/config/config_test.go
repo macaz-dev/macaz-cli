@@ -65,6 +65,38 @@ func TestSavePathReplacesExistingConfig(t *testing.T) {
 	}
 }
 
+func TestLocalAuthSelectionRoundTripsPerClient(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := Default()
+	selected := cfg
+	selected.Provider = ProviderLocalAgentsAuth
+	selected.LocalAuthAgent = "opencode"
+	selected.LocalAuthProvider = "openai"
+	selected.LocalAuthPath = "/tmp/opencode/auth.json"
+	cfg.SetClient(ClientClaude, selected)
+	if err := SavePath(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claude, err := loaded.ForClient(ClientClaude)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claude.Provider != ProviderLocalAgentsAuth || claude.LocalAuthAgent != "opencode" || claude.LocalAuthProvider != "openai" || claude.LocalAuthPath == "" {
+		t.Fatalf("Claude config = %#v", claude)
+	}
+	codex, err := loaded.ForClient(ClientCodex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codex.LocalAuthAgent != "" || codex.LocalAuthProvider != "" || codex.LocalAuthPath != "" {
+		t.Fatalf("local auth leaked into Codex config: %#v", codex)
+	}
+}
+
 func TestClientProfilesAreIndependentAndLegacyConfigMigrates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{

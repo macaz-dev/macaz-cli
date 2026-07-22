@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 	"github.com/macaz-dev/macaz-cli/internal/config"
 	"github.com/macaz-dev/macaz-cli/internal/gateway"
 	"github.com/macaz-dev/macaz-cli/internal/launcher"
+	"github.com/macaz-dev/macaz-cli/internal/localagentsauth"
 	"github.com/macaz-dev/macaz-cli/internal/provider"
 	"github.com/macaz-dev/macaz-cli/internal/provider/anthropic"
 	"github.com/macaz-dev/macaz-cli/internal/provider/codexcli"
@@ -382,6 +384,7 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 	type providerOption struct {
 		label    string
 		provider string
+		source   *localagentsauth.Source
 	}
 	reader := bufio.NewReader(streams.In)
 	legalNotice(streams.Out)
@@ -390,21 +393,53 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 	var options []providerOption
 	if client == config.ClientClaude {
 		options = []providerOption{
-			{label: "OpenAI Subscription", provider: config.ProviderOpenAISubscription},
+			{label: "OpenAI Subscription (connect account)", provider: config.ProviderOpenAISubscription},
 			{label: "OpenAI API", provider: config.ProviderOpenAIAPIKey},
 			{label: "OpenRouter API", provider: config.ProviderOpenRouterAPI},
 			{label: "Codex-CLI (experimental)", provider: config.ProviderCodexCLI},
 			{label: "OpenCode-CLI (experimental)", provider: config.ProviderOpenCodeCLI},
+			{label: "Manual provider", provider: config.ProviderManualOpenAI},
 		}
 	} else {
 		options = []providerOption{
 			{label: "OpenRouter API", provider: config.ProviderOpenRouterAPI},
 			{label: "Anthropic API", provider: config.ProviderAnthropicAPI},
 			{label: "OpenCode-CLI (experimental)", provider: config.ProviderOpenCodeCLI},
+			{label: "Manual provider", provider: config.ProviderManualOpenAI},
 		}
 	}
+	staticCount := len(options)
+	sources, scanErr := localagentsauth.Scan()
+	if scanErr != nil && streams.Err != nil {
+		_, _ = fmt.Fprintf(streams.Err, "Warning: some local agent authentications could not be scanned: %v\n", scanErr)
+	}
+	labels := map[string]int{}
+	for _, source := range sources {
+		if supportedLocalAuth(source) {
+			labels[localAuthLabel(source)]++
+		}
+	}
+	for index := range sources {
+		source := sources[index]
+		if !supportedLocalAuth(source) {
+			continue
+		}
+		label := localAuthLabel(source)
+		if labels[label] > 1 {
+			label += " [" + source.Path + "]"
+		}
+		options = append(options, providerOption{
+			label: label, provider: config.ProviderLocalAgentsAuth, source: &source,
+		})
+	}
 	for index, option := range options {
+		if index == staticCount && len(options) > staticCount {
+			_, _ = fmt.Fprintln(streams.Out, "\nAlready authenticated providers (reuse existing credentials):")
+		}
 		_, _ = fmt.Fprintf(streams.Out, "%d. %s\n", index+1, option.label)
+	}
+	if len(options) > staticCount {
+		_, _ = fmt.Fprintln(streams.Out)
 	}
 	choice, err := prompt(reader, streams.Out, fmt.Sprintf("Provider [1-%d]: ", len(options)), "")
 	if err != nil {
@@ -420,7 +455,13 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 	if selected < 0 {
 		return config.Config{}, fmt.Errorf("invalid provider choice %q", choice)
 	}
-	cfg.Provider = options[selected].provider
+	selectedOption := options[selected]
+	cfg.Provider = selectedOption.provider
+	if selectedOption.source != nil {
+		cfg.LocalAuthAgent = selectedOption.source.Agent
+		cfg.LocalAuthProvider = selectedOption.source.Provider
+		cfg.LocalAuthPath = selectedOption.source.Path
+	}
 	switch cfg.Provider {
 	case config.ProviderOpenAISubscription:
 		authCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
@@ -529,8 +570,122 @@ func wizard(ctx context.Context, client string, cfg config.Config, streams Strea
 		}
 	case config.ProviderOpenCodeCLI:
 		return configureOpenCode(cfg, reader, streams)
+	case config.ProviderManualOpenAI:
+		return configureManualProvider(cfg, reader, streams)
 	}
 	return cfg, nil
+}
+
+func configureManualProvider(cfg config.Config, reader *bufio.Reader, streams Streams) (config.Config, error) {
+	_, _ = fmt.Fprintln(streams.Out, "Manual provider type:")
+	_, _ = fmt.Fprintln(streams.Out, "1. OpenAI-compatible endpoint")
+	_, _ = fmt.Fprintln(streams.Out, "2. auth.json path")
+	choice, err := prompt(reader, streams.Out, "Type [1-2]: ", "")
+	if err != nil {
+		return config.Config{}, err
+	}
+	switch choice {
+	case "1":
+		baseURL, err := prompt(reader, streams.Out, "Endpoint URL (including port)", "http://localhost:11434/v1")
+		if err != nil {
+			return config.Config{}, err
+		}
+		parsed, err := url.Parse(baseURL)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return config.Config{}, fmt.Errorf("invalid OpenAI-compatible endpoint %q", baseURL)
+		}
+		if parsed.RawQuery != "" || parsed.Fragment != "" {
+			return config.Config{}, fmt.Errorf("OpenAI-compatible endpoint must not contain a query or fragment")
+		}
+		if parsed.Path == "" || parsed.Path == "/" {
+			parsed.Path = "/v1"
+		}
+		model, err := prompt(reader, streams.Out, "Model ID: ", "")
+		if err != nil {
+			return config.Config{}, err
+		}
+		if strings.TrimSpace(model) == "" {
+			return config.Config{}, errors.New("model ID cannot be empty")
+		}
+		cfg.Provider = config.ProviderManualOpenAI
+		cfg.OpenAIBaseURL = strings.TrimRight(parsed.String(), "/")
+		cfg.OpenAIModel = model
+		for _, alias := range []string{"default", "opus", "sonnet", "haiku"} {
+			cfg.ModelMap[alias] = model
+		}
+		return cfg, nil
+	case "2":
+		path, err := prompt(reader, streams.Out, "auth.json path: ", "")
+		if err != nil {
+			return config.Config{}, err
+		}
+		sources, err := localagentsauth.ScanPath(path)
+		if err != nil {
+			return config.Config{}, fmt.Errorf("scan auth.json: %w", err)
+		}
+		supported := sources[:0]
+		for _, source := range sources {
+			if supportedLocalAuth(source) {
+				supported = append(supported, source)
+			}
+		}
+		if len(supported) == 0 {
+			return config.Config{}, errors.New("auth.json contains no credential with an implemented direct adapter")
+		}
+		selected := 0
+		if len(supported) > 1 {
+			_, _ = fmt.Fprintln(streams.Out, "Credentials in auth.json:")
+			for index, source := range supported {
+				_, _ = fmt.Fprintf(streams.Out, "%d. %s\n", index+1, localAuthLabel(source))
+			}
+			selectedChoice, err := prompt(reader, streams.Out, fmt.Sprintf("Credential [1-%d]", len(supported)), "1")
+			if err != nil {
+				return config.Config{}, err
+			}
+			selected = -1
+			for index := range supported {
+				if selectedChoice == fmt.Sprint(index+1) {
+					selected = index
+					break
+				}
+			}
+			if selected < 0 {
+				return config.Config{}, fmt.Errorf("invalid credential choice %q", selectedChoice)
+			}
+		}
+		source := supported[selected]
+		cfg.Provider = config.ProviderLocalAgentsAuth
+		cfg.LocalAuthAgent = source.Agent
+		cfg.LocalAuthProvider = source.Provider
+		cfg.LocalAuthPath = source.Path
+		return cfg, nil
+	default:
+		return config.Config{}, fmt.Errorf("invalid manual provider type %q", choice)
+	}
+}
+
+func supportedLocalAuth(source localagentsauth.Source) bool {
+	if source.Type != "oauth" && source.Type != "api" {
+		return false
+	}
+	return source.Provider == "openai" || source.Agent == "pi" && source.Provider == "openai-codex"
+}
+
+func localAuthLabel(source localagentsauth.Source) string {
+	service := "OpenAI Subscription"
+	if source.Type == "api" {
+		service = "OpenAI API key"
+	}
+	agent := source.Agent
+	switch source.Agent {
+	case "codex":
+		agent = "Codex"
+	case "opencode":
+		agent = "OpenCode"
+	case "pi":
+		agent = "Pi"
+	}
+	return service + " (" + agent + " auth)"
 }
 
 func configureOpenCode(cfg config.Config, reader *bufio.Reader, streams Streams) (config.Config, error) {
@@ -606,6 +761,10 @@ func makeProvider(cfg config.Config) (provider.Provider, error) {
 		return codexcli.New(cfg), nil
 	case config.ProviderOpenCodeCLI:
 		return opencodecli.New(cfg), nil
+	case config.ProviderLocalAgentsAuth:
+		return openaiadapter.NewLocalAgentsAuth(cfg)
+	case config.ProviderManualOpenAI:
+		return openaiadapter.New(openaiadapter.ModeCompatible, cfg)
 	case config.ProviderOpenRouterAPI:
 		return openrouter.New(cfg), nil
 	case config.ProviderAnthropicAPI:
