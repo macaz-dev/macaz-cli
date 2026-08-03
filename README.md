@@ -196,11 +196,22 @@ by vendor CLIs.
 
 On each `macaz claude` start, macaz imports user- and local-scoped MCP server
 definitions from the normal Claude Code state into the isolated macaz Claude
-profile. This lets the same configured MCP servers load in normal Claude Code
-and through macaz without copying the rest of Claude's identity, session, trust,
-or onboarding state. Project-scoped `.mcp.json` files remain project files and
-are discovered normally by both profiles; Claude Code may ask for approval once
-per profile.
+profile. This lets the same locally configured MCP servers load in normal
+Claude Code and through macaz without copying the rest of Claude's identity,
+session, trust, or onboarding state. Project-scoped `.mcp.json` files remain
+project files and are discovered normally by both profiles; Claude Code may ask
+for approval once per profile.
+
+> [!NOTE]
+> Claude.ai account connectors are not local MCP definitions and cannot be
+> imported this way. Claude Code fetches those connectors only while its active
+> authentication method is a Claude.ai subscription; it does not load them when
+> `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or a third-party provider is
+> active. Macaz must set a local authentication token to route model requests,
+> so entries such as `claude.ai Google Drive`, `claude.ai Google Calendar`, and
+> `claude.ai Gmail` shown by normal `claude mcp list` are unavailable through
+> macaz. See the official
+> [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp#use-mcp-servers-from-claudeai).
 
 The normal Claude profile is authoritative for an imported server name:
 
@@ -213,11 +224,11 @@ Change or remove an imported server with the normal `claude mcp` command; the
 next macaz start will refresh that change. Use `macaz claude mcp add` or
 `remove` for servers intended to exist only in the isolated macaz profile.
 
-Only MCP definitions are imported. Definitions can themselves contain command
-arguments, URLs, headers, or environment variables, so the isolated copy is
-written with private file permissions. Claude Code authentication and generic
-profile state are not copied. An OAuth-backed MCP server may require a separate
-login for the isolated profile:
+Only local MCP definitions are imported. Definitions can themselves contain
+command arguments, URLs, headers, or environment variables, so the isolated
+copy is written with private file permissions. Claude Code authentication,
+Claude.ai connectors, and generic profile state are not copied. A standard
+OAuth-backed MCP server may require a separate login for the isolated profile:
 
 ```sh
 macaz claude mcp login SERVER_NAME

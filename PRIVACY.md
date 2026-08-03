@@ -54,6 +54,12 @@ the macaz import marker stores only server names and hashes. OAuth-backed MCP
 servers may require authentication in the isolated profile. MCP server
 processes and endpoints handle their own data independently of macaz.
 
+Claude.ai account connectors are not stored as local MCP definitions and are
+not imported. Claude Code makes those connectors available only while its
+active authentication method is a Claude.ai subscription. They are unavailable
+while macaz configures Claude Code to use its authenticated local routing
+endpoint and the selected non-Claude provider.
+
 `macaz reset claude` or `macaz reset codex` removes only that client's macaz
 configuration and isolated profile. Shared provider credentials and the other
 client remain. `macaz reset` without a client removes all macaz configuration,
