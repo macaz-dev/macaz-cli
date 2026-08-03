@@ -255,7 +255,7 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 	if err := json.Unmarshal(raw, &report); err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Args) != 4 || !slices.Equal(report.Args[:2], []string{
+	if len(report.Args) != 4 || !slices.Equal(report.Args[2:], []string{
 		"--model",
 		"claude-macaz-fake-a1b2c3d4",
 	}) {
@@ -264,11 +264,11 @@ func TestClaudeUsesNormalPermissionsByDefaultAndReturnsWhenItExits(t *testing.T)
 	if slices.Contains(report.Args, "--dangerously-skip-permissions") {
 		t.Fatalf("full permissions were enabled without an explicit user flag: %#v", report.Args)
 	}
-	if report.Args[2] != "--managed-settings" {
+	if report.Args[0] != "--managed-settings" {
 		t.Fatalf("managed settings flag missing: %#v", report.Args)
 	}
 	var managed map[string]any
-	if err := json.Unmarshal([]byte(report.Args[3]), &managed); err != nil {
+	if err := json.Unmarshal([]byte(report.Args[1]), &managed); err != nil {
 		t.Fatalf("decode managed settings: %v", err)
 	}
 	if managed["model"] != "claude-macaz-fake-a1b2c3d4" || managed["enforceAvailableModels"] != true {
@@ -447,6 +447,232 @@ func TestConfiguredEffortUpdatesOnceThenPreservesClaudeSelection(t *testing.T) {
 	}
 }
 
+func TestSyncClaudeMCPConfigurationImportsUserAndLocalServers(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source-claude")
+	profileDir := filepath.Join(root, "macaz-claude")
+	projectDir := filepath.Join(root, "project")
+	t.Setenv("CLAUDE_CONFIG_DIR", sourceDir)
+
+	sourceState := map[string]any{
+		"userID": "normal-user",
+		"mcpServers": map[string]any{
+			"normal-user-server": map[string]any{
+				"type":    "stdio",
+				"command": "normal-user-command",
+				"args":    []any{"serve"},
+				"env":     map[string]any{"TOKEN": "inline-secret"},
+			},
+		},
+		"projects": map[string]any{
+			projectDir: map[string]any{
+				"hasTrustDialogAccepted": true,
+				"mcpServers": map[string]any{
+					"normal-local-server": map[string]any{
+						"type":    "stdio",
+						"command": "normal-local-command",
+					},
+				},
+			},
+		},
+	}
+	if err := config.WritePrivateJSON(filepath.Join(sourceDir, ".claude.json"), sourceState); err != nil {
+		t.Fatal(err)
+	}
+	sourceBefore, err := os.ReadFile(filepath.Join(sourceDir, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileState := map[string]any{
+		"userID": "isolated-user",
+		"mcpServers": map[string]any{
+			"macaz-user-server": map[string]any{"type": "stdio", "command": "macaz-user-command"},
+		},
+		"projects": map[string]any{
+			projectDir: map[string]any{
+				"hasTrustDialogAccepted": false,
+				"mcpServers": map[string]any{
+					"macaz-local-server": map[string]any{"type": "stdio", "command": "macaz-local-command"},
+				},
+			},
+		},
+	}
+	if err := config.WritePrivateJSON(filepath.Join(profileDir, ".claude.json"), profileState); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncClaudeMCPConfiguration(sourceDir, profileDir); err != nil {
+		t.Fatal(err)
+	}
+	profileRaw, err := os.ReadFile(filepath.Join(profileDir, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(profileRaw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["userID"] != "isolated-user" {
+		t.Fatalf("isolated Claude identity changed: %#v", got)
+	}
+	userServers := got["mcpServers"].(map[string]any)
+	if userServers["normal-user-server"].(map[string]any)["command"] != "normal-user-command" ||
+		userServers["macaz-user-server"].(map[string]any)["command"] != "macaz-user-command" {
+		t.Fatalf("user MCP servers = %#v", userServers)
+	}
+	projects := got["projects"].(map[string]any)
+	project := projects[projectDir].(map[string]any)
+	if project["hasTrustDialogAccepted"] != false {
+		t.Fatalf("isolated project trust changed: %#v", project)
+	}
+	localServers := project["mcpServers"].(map[string]any)
+	if localServers["normal-local-server"].(map[string]any)["command"] != "normal-local-command" ||
+		localServers["macaz-local-server"].(map[string]any)["command"] != "macaz-local-command" {
+		t.Fatalf("local MCP servers = %#v", localServers)
+	}
+	sourceAfter, err := os.ReadFile(filepath.Join(sourceDir, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(sourceAfter) != string(sourceBefore) {
+		t.Fatal("normal Claude state was modified during MCP import")
+	}
+	marker, err := os.ReadFile(filepath.Join(profileDir, ".macaz-mcp-imports.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(marker), "inline-secret") || strings.Contains(string(marker), "normal-user-command") {
+		t.Fatalf("MCP import marker contains server configuration: %s", marker)
+	}
+}
+
+func TestSourceClaudeStatePathUsesSiblingOfDefaultConfigDirectory(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := sourceClaudeStatePath(filepath.Join(home, ".claude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, ".claude.json")
+	if got != want {
+		t.Fatalf("source Claude state path = %q, want %q", got, want)
+	}
+}
+
+func TestSyncClaudeMCPConfigurationWithoutSourcePreservesMacazServers(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "missing-source")
+	profileDir := filepath.Join(root, "macaz-claude")
+	t.Setenv("CLAUDE_CONFIG_DIR", sourceDir)
+	profilePath := filepath.Join(profileDir, ".claude.json")
+	if err := config.WritePrivateJSON(profilePath, map[string]any{
+		"mcpServers": map[string]any{
+			"macaz-only": map[string]any{"type": "stdio", "command": "macaz-command"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syncClaudeMCPConfiguration(sourceDir, profileDir); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("Macaz MCP state changed without a source profile: before=%s after=%s", before, after)
+	}
+}
+
+func TestSyncClaudeMCPConfigurationRemovesOnlyUnchangedImports(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source-claude")
+	profileDir := filepath.Join(root, "macaz-claude")
+	projectDir := filepath.Join(root, "project")
+	t.Setenv("CLAUDE_CONFIG_DIR", sourceDir)
+	sourcePath := filepath.Join(sourceDir, ".claude.json")
+	profilePath := filepath.Join(profileDir, ".claude.json")
+	if err := config.WritePrivateJSON(sourcePath, map[string]any{
+		"mcpServers": map[string]any{
+			"unchanged-import":  map[string]any{"type": "stdio", "command": "source-command"},
+			"overridden-import": map[string]any{"type": "stdio", "command": "source-command"},
+		},
+		"projects": map[string]any{
+			projectDir: map[string]any{
+				"mcpServers": map[string]any{
+					"local-import": map[string]any{"type": "stdio", "command": "local-command"},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncClaudeMCPConfiguration(sourceDir, profileDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.WritePrivateJSON(sourcePath, map[string]any{
+		"mcpServers": map[string]any{
+			"unchanged-import":  map[string]any{"type": "stdio", "command": "source-command"},
+			"overridden-import": map[string]any{"type": "stdio", "command": "source-updated"},
+		},
+		"projects": map[string]any{
+			projectDir: map[string]any{
+				"mcpServers": map[string]any{
+					"local-import": map[string]any{"type": "stdio", "command": "local-command"},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncClaudeMCPConfiguration(sourceDir, profileDir); err != nil {
+		t.Fatal(err)
+	}
+	profile, _, err := loadClaudeJSONObject(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers := profile["mcpServers"].(map[string]any)
+	if servers["overridden-import"].(map[string]any)["command"] != "source-updated" {
+		t.Fatalf("updated source MCP server was not imported: %#v", servers)
+	}
+	servers["overridden-import"] = map[string]any{"type": "stdio", "command": "macaz-override"}
+	servers["macaz-only"] = map[string]any{"type": "stdio", "command": "macaz-command"}
+	if err := config.WritePrivateJSON(profilePath, profile); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.WritePrivateJSON(sourcePath, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := syncClaudeMCPConfiguration(sourceDir, profileDir); err != nil {
+		t.Fatal(err)
+	}
+	profile, _, err = loadClaudeJSONObject(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers = profile["mcpServers"].(map[string]any)
+	if _, exists := servers["unchanged-import"]; exists {
+		t.Fatalf("removed source import was retained: %#v", servers)
+	}
+	if servers["overridden-import"].(map[string]any)["command"] != "macaz-override" ||
+		servers["macaz-only"].(map[string]any)["command"] != "macaz-command" {
+		t.Fatalf("Macaz MCP overrides were removed: %#v", servers)
+	}
+	project := profile["projects"].(map[string]any)[projectDir].(map[string]any)
+	if _, exists := project["mcpServers"]; exists {
+		t.Fatalf("removed local MCP import was retained: %#v", project)
+	}
+}
+
 func TestClaudePinsInternalModelsWithoutCreatingFamilyAliasRows(t *testing.T) {
 	root := t.TempDir()
 	reportPath := filepath.Join(root, "report.json")
@@ -524,7 +750,7 @@ func TestGatewayArgsFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selected != models[0] || args[1] != models[0] {
+	if selected != models[0] || args[3] != models[0] {
 		t.Fatalf("resolved args = %#v, selected = %q", args, selected)
 	}
 	withBypass, _, err := gatewayArgs(
@@ -543,6 +769,17 @@ func TestGatewayArgsFailClosed(t *testing.T) {
 	}
 	if _, _, err := gatewayArgs([]string{"--fallback-model", "opus"}, models, models[0]); err == nil {
 		t.Fatal("client-side provider fallback was accepted inside macaz")
+	}
+}
+
+func TestGatewayArgsPlaceManagedSettingsBeforeClaudeSubcommand(t *testing.T) {
+	models := []string{"claude-macaz-primary-a1", "claude-macaz-secondary-b2"}
+	args, _, err := gatewayArgs([]string{"mcp", "list"}, models, models[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(args) != 4 || args[0] != "--managed-settings" || !slices.Equal(args[2:], []string{"mcp", "list"}) {
+		t.Fatalf("args = %#v", args)
 	}
 }
 

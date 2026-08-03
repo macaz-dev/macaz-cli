@@ -192,13 +192,65 @@ all macaz-managed credentials, configuration, and isolated session history. It
 does not remove normal vendor-client profiles or credentials managed directly
 by vendor CLIs.
 
+### Claude MCP servers
+
+On each `macaz claude` start, macaz imports user- and local-scoped MCP server
+definitions from the normal Claude Code state into the isolated macaz Claude
+profile. This lets the same locally configured MCP servers load in normal
+Claude Code and through macaz without copying the rest of Claude's identity,
+session, trust, or onboarding state. Project-scoped `.mcp.json` files remain
+project files and are discovered normally by both profiles; Claude Code may ask
+for approval once per profile.
+
+> [!NOTE]
+> Claude.ai account connectors are not local MCP definitions and cannot be
+> imported this way. Claude Code fetches those connectors only while its active
+> authentication method is a Claude.ai subscription; it does not load them when
+> `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, or a third-party provider is
+> active. Macaz must set a local authentication token to route model requests,
+> so entries such as `claude.ai Google Drive`, `claude.ai Google Calendar`, and
+> `claude.ai Gmail` shown by normal `claude mcp list` are unavailable through
+> macaz. See the official
+> [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp#use-mcp-servers-from-claudeai).
+
+The normal Claude profile is authoritative for an imported server name:
+
+- additions and updates are refreshed into the macaz profile at startup;
+- a removal deletes the prior imported copy when that copy was not changed in
+  the macaz profile; and
+- MCP servers with names that exist only in the macaz profile are preserved.
+
+Change or remove an imported server with the normal `claude mcp` command; the
+next macaz start will refresh that change. Use `macaz claude mcp add` or
+`remove` for servers intended to exist only in the isolated macaz profile.
+
+Only local MCP definitions are imported. Definitions can themselves contain
+command arguments, URLs, headers, or environment variables, so the isolated
+copy is written with private file permissions. Claude Code authentication,
+Claude.ai connectors, and generic profile state are not copied. A standard
+OAuth-backed MCP server may require a separate login for the isolated profile:
+
+```sh
+macaz claude mcp login SERVER_NAME
+```
+
+Inspect or manage the resulting profile with Claude Code's normal MCP commands:
+
+```sh
+macaz claude mcp list
+macaz claude mcp get SERVER_NAME
+macaz claude mcp add --scope user SERVER_NAME -- COMMAND ARGUMENTS...
+macaz claude mcp remove --scope user SERVER_NAME
+```
+
 ## Isolation and security
 
 - The local routing layer listens on a random `127.0.0.1` port.
 - A new random authentication token is generated for every launch.
 - The token exists only in the child process environment.
 - Config and profile files use private permissions where supported.
-- Normal Claude and Codex profiles are not modified.
+- Normal Claude and Codex profiles are not modified. Claude MCP definitions are
+  read and copied into the isolated macaz profile as described above.
 - The local routing process stops when the launched client exits.
 - There is no fallback to a different provider or official model.
 - macaz contains no project-operated analytics or telemetry client.

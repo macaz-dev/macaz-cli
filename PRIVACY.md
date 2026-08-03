@@ -44,6 +44,22 @@ prompts, and rules from the normal Codex profile, but it does not copy Codex
 authentication into macaz. The local router does not independently persist
 model request or response bodies.
 
+At Claude startup, macaz imports user- and local-scoped MCP server definitions
+from the normal Claude Code state into the isolated Claude profile. It does not
+copy Claude account authentication, identity, conversation history, project
+trust, or onboarding state. MCP definitions may include commands, URLs,
+headers, and environment variables supplied by the user, including inline
+secrets. The imported definitions are stored in the private isolated profile;
+the macaz import marker stores only server names and hashes. OAuth-backed MCP
+servers may require authentication in the isolated profile. MCP server
+processes and endpoints handle their own data independently of macaz.
+
+Claude.ai account connectors are not stored as local MCP definitions and are
+not imported. Claude Code makes those connectors available only while its
+active authentication method is a Claude.ai subscription. They are unavailable
+while macaz configures Claude Code to use its authenticated local routing
+endpoint and the selected non-Claude provider.
+
 `macaz reset claude` or `macaz reset codex` removes only that client's macaz
 configuration and isolated profile. Shared provider credentials and the other
 client remain. `macaz reset` without a client removes all macaz configuration,

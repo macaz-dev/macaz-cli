@@ -2,6 +2,7 @@ package launcher
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -207,6 +209,9 @@ func prepareClaudeProfile(cfg config.Config, models []string, defaultModel strin
 			return "", "", err
 		}
 	}
+	if err := syncClaudeMCPConfiguration(sourceDir, profileDir); err != nil {
+		return "", "", err
+	}
 	for _, name := range []string{"agents", "commands", "skills", "plugins", "CLAUDE.md"} {
 		if err := shareClaudeAsset(filepath.Join(sourceDir, name), filepath.Join(profileDir, name)); err != nil {
 			return "", "", err
@@ -296,6 +301,278 @@ func loadClaudeSettings(profilePath, sourcePath string) (map[string]any, error) 
 		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
 	return settings, nil
+}
+
+const claudeMCPImportStateVersion = 1
+
+type claudeMCPImportState struct {
+	Version  int                          `json:"version"`
+	User     map[string]string            `json:"user,omitempty"`
+	Projects map[string]map[string]string `json:"projects,omitempty"`
+}
+
+type claudeMCPConfiguration struct {
+	User     map[string]any
+	Projects map[string]map[string]any
+}
+
+// syncClaudeMCPConfiguration copies only user- and local-scoped MCP server
+// definitions into the isolated profile. Source definitions win by name, while
+// the hash-only marker lets removals delete an unchanged import without
+// deleting a server that the user subsequently customized inside macaz.
+func syncClaudeMCPConfiguration(sourceDir, profileDir string) error {
+	sourcePath, err := sourceClaudeStatePath(sourceDir)
+	if err != nil {
+		return err
+	}
+	source, exists, err := loadClaudeJSONObject(sourcePath)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	sourceMCP, err := extractClaudeMCPConfiguration(source, sourcePath)
+	if err != nil {
+		return err
+	}
+
+	destinationPath := filepath.Join(profileDir, ".claude.json")
+	destination, _, err := loadClaudeJSONObject(destinationPath)
+	if err != nil {
+		return err
+	}
+	markerPath := filepath.Join(profileDir, ".macaz-mcp-imports.json")
+	previous, markerExists, err := loadClaudeMCPImportState(markerPath)
+	if err != nil {
+		return err
+	}
+	next := claudeMCPImportState{
+		Version:  claudeMCPImportStateVersion,
+		User:     map[string]string{},
+		Projects: map[string]map[string]string{},
+	}
+
+	changed := false
+	next.User, changed, err = syncClaudeMCPServerScope(destination, sourceMCP.User, previous.User)
+	if err != nil {
+		return fmt.Errorf("sync user MCP servers: %w", err)
+	}
+
+	destinationProjects, destinationProjectsExist, err := claudeJSONObjectField(destination, "projects", destinationPath)
+	if err != nil {
+		return err
+	}
+	projectNames := map[string]bool{}
+	for name := range sourceMCP.Projects {
+		projectNames[name] = true
+	}
+	for name := range previous.Projects {
+		projectNames[name] = true
+	}
+	for name := range projectNames {
+		sourceServers := sourceMCP.Projects[name]
+		previousServers := previous.Projects[name]
+		destinationProject, projectExists, err := claudeJSONObjectField(destinationProjects, name, destinationPath)
+		if err != nil {
+			return err
+		}
+		if !projectExists && len(sourceServers) == 0 {
+			continue
+		}
+		if !projectExists {
+			destinationProject = map[string]any{}
+			destinationProjects[name] = destinationProject
+			if !destinationProjectsExist {
+				destination["projects"] = destinationProjects
+				destinationProjectsExist = true
+			}
+		}
+		var projectChanged bool
+		nextServers, projectChanged, err := syncClaudeMCPServerScope(destinationProject, sourceServers, previousServers)
+		if err != nil {
+			return fmt.Errorf("sync MCP servers for project %q: %w", name, err)
+		}
+		if len(nextServers) > 0 {
+			next.Projects[name] = nextServers
+		}
+		changed = changed || projectChanged
+	}
+
+	if changed {
+		if err := config.WritePrivateJSON(destinationPath, destination); err != nil {
+			return fmt.Errorf("write isolated Claude MCP configuration: %w", err)
+		}
+	}
+	if len(next.User) > 0 || len(next.Projects) > 0 || markerExists {
+		if err := config.WritePrivateJSON(markerPath, next); err != nil {
+			return fmt.Errorf("write Claude MCP import state: %w", err)
+		}
+	}
+	return nil
+}
+
+func sourceClaudeStatePath(sourceDir string) (string, error) {
+	if configured := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); configured != "" &&
+		filepath.Clean(configured) == filepath.Clean(sourceDir) {
+		return filepath.Join(sourceDir, ".claude.json"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	// Claude's default state file is ~/.claude.json, but a custom
+	// CLAUDE_CONFIG_DIR stores it inside that directory.
+	if filepath.Clean(sourceDir) == filepath.Join(filepath.Clean(home), ".claude") {
+		return filepath.Join(home, ".claude.json"), nil
+	}
+	return filepath.Join(sourceDir, ".claude.json"), nil
+}
+
+func loadClaudeJSONObject(path string) (map[string]any, bool, error) {
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]any{}, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	value := map[string]any{}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, false, fmt.Errorf("decode %s: %w", path, err)
+	}
+	return value, true, nil
+}
+
+func extractClaudeMCPConfiguration(root map[string]any, path string) (claudeMCPConfiguration, error) {
+	result := claudeMCPConfiguration{
+		User:     map[string]any{},
+		Projects: map[string]map[string]any{},
+	}
+	user, exists, err := claudeJSONObjectField(root, "mcpServers", path)
+	if err != nil {
+		return result, err
+	}
+	if exists {
+		result.User = user
+	}
+	projects, exists, err := claudeJSONObjectField(root, "projects", path)
+	if err != nil || !exists {
+		return result, err
+	}
+	for name := range projects {
+		project, exists, err := claudeJSONObjectField(projects, name, path)
+		if err != nil {
+			return result, err
+		}
+		if !exists {
+			continue
+		}
+		servers, exists, err := claudeJSONObjectField(project, "mcpServers", path)
+		if err != nil {
+			return result, err
+		}
+		if exists {
+			result.Projects[name] = servers
+		}
+	}
+	return result, nil
+}
+
+func claudeJSONObjectField(parent map[string]any, name, path string) (map[string]any, bool, error) {
+	value, exists := parent[name]
+	if !exists || value == nil {
+		return map[string]any{}, false, nil
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, false, fmt.Errorf("decode %s: %s must be a JSON object", path, name)
+	}
+	return object, true, nil
+}
+
+func syncClaudeMCPServerScope(destination map[string]any, source map[string]any, previous map[string]string) (map[string]string, bool, error) {
+	destinationServers, destinationServersExist, err := claudeJSONObjectField(destination, "mcpServers", "isolated Claude .claude.json")
+	if err != nil {
+		return nil, false, err
+	}
+	changed := false
+	next := map[string]string{}
+	for name, server := range source {
+		hash, err := hashClaudeMCPServer(server)
+		if err != nil {
+			return nil, false, err
+		}
+		next[name] = hash
+		if current, exists := destinationServers[name]; !exists || !reflect.DeepEqual(current, server) {
+			destinationServers[name] = server
+			changed = true
+		}
+	}
+	for name, importedHash := range previous {
+		if _, stillImported := source[name]; stillImported {
+			continue
+		}
+		current, exists := destinationServers[name]
+		if !exists {
+			continue
+		}
+		currentHash, err := hashClaudeMCPServer(current)
+		if err != nil {
+			return nil, false, err
+		}
+		if currentHash == importedHash {
+			delete(destinationServers, name)
+			changed = true
+		}
+	}
+	if changed {
+		if len(destinationServers) == 0 {
+			delete(destination, "mcpServers")
+		} else {
+			destination["mcpServers"] = destinationServers
+		}
+	} else if destinationServersExist {
+		destination["mcpServers"] = destinationServers
+	}
+	return next, changed, nil
+}
+
+func hashClaudeMCPServer(server any) (string, error) {
+	raw, err := json.Marshal(server)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum[:]), nil
+}
+
+func loadClaudeMCPImportState(path string) (claudeMCPImportState, bool, error) {
+	state := claudeMCPImportState{
+		Version:  claudeMCPImportStateVersion,
+		User:     map[string]string{},
+		Projects: map[string]map[string]string{},
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return state, false, nil
+	}
+	if err != nil {
+		return state, false, err
+	}
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return state, false, fmt.Errorf("decode %s: %w", path, err)
+	}
+	if state.Version != claudeMCPImportStateVersion {
+		return state, false, fmt.Errorf("decode %s: unsupported version %d", path, state.Version)
+	}
+	if state.User == nil {
+		state.User = map[string]string{}
+	}
+	if state.Projects == nil {
+		state.Projects = map[string]map[string]string{}
+	}
+	return state, true, nil
 }
 
 func profileProviderChanged(profileDir, selectedProvider string) (bool, error) {
@@ -476,7 +753,7 @@ func gatewayArgs(args, models []string, selected string) ([]string, string, erro
 	if err != nil {
 		return nil, "", err
 	}
-	result = append(result, "--managed-settings", string(managed))
+	result = append([]string{"--managed-settings", string(managed)}, result...)
 	return result, launchModel, nil
 }
 
