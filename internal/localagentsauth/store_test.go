@@ -76,6 +76,12 @@ func TestCodexOAuthUpdatePreservesTokenPayload(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "auth.json")
 	writeTestFile(t, path, `{"auth_mode":"chatgpt","tokens":{"id_token":"id-token","access_token":"old","refresh_token":"expected","account_id":"acct"},"custom":"keep"}`)
 	source := Source{Agent: "codex", Provider: "openai", Path: path}
+	lockPath := path + ".lock"
+	writeTestFile(t, lockPath, "")
+	before, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := WithLock(source, func() error {
 		updated, err := UpdateOAuth(source, "expected", "new-access", "new-refresh", 1234, "acct-next", "new-id-token")
 		if !updated {
@@ -84,6 +90,10 @@ func TestCodexOAuthUpdatePreservesTokenPayload(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+	after, err := os.Stat(lockPath)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("Codex lock file was replaced or removed: %v", err)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {

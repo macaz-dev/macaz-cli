@@ -25,7 +25,7 @@ const (
 	parallelToolGrace   = 300 * time.Millisecond
 	requestPhaseTimeout = 60 * time.Second
 	eventIdleTimeout    = 5 * time.Minute
-	bridgeInstructions  = "Macaz is using Codex only as the inference backend for Claude Code. Use only client-provided tools; the client executes them. Never call built-in provider tools or perform shell, file, browser, app, skill, planning, or subagent work inside Codex."
+	bridgeInstructions  = "Macaz is using Codex as the inference backend for Claude Code. For image generation or editing, use the native image_gen tool when available. If it is unavailable or fails, explain that to the user. Draw an SVG only when the user wants a vector illustration. Use attached images for edits, or use a Claude-provided tool to read a local image and return it as an attachment. All other tools are provided and executed by Claude Code. Never perform shell, file, browser, app, skill, planning, or subagent work inside Codex."
 )
 
 type Provider struct {
@@ -151,6 +151,7 @@ func (p *Provider) discoverModels(ctx context.Context) ([]provider.Model, error)
 	if err := rpc.notify("initialized", map[string]any{}); err != nil {
 		return nil, err
 	}
+	contextWindows := cachedModelContextWindows(exe)
 	var models []provider.Model
 	var cursor any
 	for requestID := 2; ; requestID++ {
@@ -186,6 +187,9 @@ func (p *Provider) discoverModels(ctx context.Context) ([]provider.Model, error)
 			if contextWindow == 0 {
 				contextWindow = int64Value(item["context_window"])
 			}
+			if contextWindow == 0 {
+				contextWindow = contextWindows[modelID]
+			}
 			models = append(models, provider.Model{
 				ID:              modelID,
 				DisplayName:     first(stringValue(item["displayName"]), modelID),
@@ -206,6 +210,27 @@ func (p *Provider) discoverModels(ctx context.Context) ([]provider.Model, error)
 		return nil, errors.New("Codex app-server returned no models")
 	}
 	return models, nil
+}
+
+func cachedModelContextWindows(executable string) map[string]int64 {
+	raw, err := loadDirectModelCatalog(executable)
+	if err != nil {
+		return nil
+	}
+	var catalog struct {
+		Models []struct {
+			Slug          string `json:"slug"`
+			ContextWindow int64  `json:"context_window"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		return nil
+	}
+	windows := make(map[string]int64, len(catalog.Models))
+	for _, model := range catalog.Models {
+		windows[strings.TrimSpace(model.Slug)] = model.ContextWindow
+	}
+	return windows
 }
 
 func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit protocol.EmitFunc) (protocol.Result, error) {
@@ -338,6 +363,25 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 		StopReason: "end_turn",
 	}
 	var textIndex = -1
+	appendText := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		if textIndex < 0 {
+			textIndex = len(result.Blocks)
+			result.Blocks = append(result.Blocks, protocol.Block{Type: "text"})
+			if req.Stream && emit != nil {
+				if err := emit(protocol.Event{Kind: protocol.EventBlockStart, Index: textIndex, Block: protocol.Block{Type: "text"}}); err != nil {
+					return err
+				}
+			}
+		}
+		result.Blocks[textIndex].Text += delta
+		if req.Stream && emit != nil {
+			return emit(protocol.Event{Kind: protocol.EventBlockDelta, Index: textIndex, DeltaType: "text_delta", Delta: delta})
+		}
+		return nil
+	}
 	reasoningIndexes := make(map[string]int)
 	var toolTimer <-chan time.Time
 	var timer *time.Timer
@@ -418,24 +462,8 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 					}
 				}
 			case "item/agentMessage/delta":
-				delta := stringValue(envelope.Params["delta"])
-				if delta == "" {
-					continue
-				}
-				if textIndex < 0 {
-					textIndex = len(result.Blocks)
-					result.Blocks = append(result.Blocks, protocol.Block{Type: "text"})
-					if req.Stream && emit != nil {
-						if err := emit(protocol.Event{Kind: protocol.EventBlockStart, Index: textIndex, Block: protocol.Block{Type: "text"}}); err != nil {
-							return protocol.Result{}, err
-						}
-					}
-				}
-				result.Blocks[textIndex].Text += delta
-				if req.Stream && emit != nil {
-					if err := emit(protocol.Event{Kind: protocol.EventBlockDelta, Index: textIndex, DeltaType: "text_delta", Delta: delta}); err != nil {
-						return protocol.Result{}, err
-					}
+				if err := appendText(stringValue(envelope.Params["delta"])); err != nil {
+					return protocol.Result{}, err
 				}
 			case "item/tool/call":
 				if textIndex >= 0 && req.Stream && emit != nil {
@@ -524,6 +552,16 @@ func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit pro
 				}
 			case "item/completed":
 				item := mapValue(envelope.Params["item"])
+				if stringValue(item["type"]) == "imageGeneration" && stringValue(item["status"]) == "completed" {
+					path, err := generatedImagePath(item, state.threadID)
+					if err != nil {
+						return protocol.Result{}, err
+					}
+					if err := appendText(generatedImageLink(path)); err != nil {
+						return protocol.Result{}, err
+					}
+					continue
+				}
 				if stringValue(item["type"]) != "reasoning" {
 					continue
 				}
@@ -609,9 +647,10 @@ func appServerArgs() []string {
 		"--disable", "browser_use_external",
 		"--disable", "browser_use_full_cdp_access",
 		"--disable", "computer_use",
-		"--disable", "image_generation",
+		"--enable", "image_generation",
 		"--disable", "in_app_browser",
 		"--disable", "multi_agent",
+		"-c", `features.multi_agent_v2=false`,
 		"--disable", "plugins",
 		"--disable", "shell_tool",
 		"--disable", "unified_exec",
@@ -739,11 +778,11 @@ func canonicalCodexPath(path, cwd string) string {
 
 func isNativeTool(itemType string) bool {
 	switch itemType {
-	case "", "userMessage", "agentMessage", "reasoning", "dynamicToolCall":
+	case "", "userMessage", "agentMessage", "reasoning", "dynamicToolCall", "imageGeneration":
 		return false
 	default:
 		// Fail closed when a newer Codex release introduces another thread item.
-		// macaz permits only passive model output and client-owned dynamic tools;
+		// macaz permits model output, image generation, and client-owned tools;
 		// every provider-side execution/context item is forbidden.
 		return true
 	}
@@ -858,7 +897,8 @@ func (r *rpcClient) read(reader io.Reader) {
 		close(r.events)
 	}()
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64<<10), 32<<20)
+	// A Codex image result can carry 32 MiB of image data before base64 encoding.
+	scanner.Buffer(make([]byte, 64<<10), 48<<20)
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {

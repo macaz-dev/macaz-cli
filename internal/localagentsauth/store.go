@@ -50,12 +50,9 @@ func Scan() ([]Source, error) {
 				problems = append(problems, fmt.Errorf("inspect %s credentials at %s: %w", agent, path, statErr))
 				continue
 			}
-			var found []Source
-			err := WithLock(Source{Agent: agent, Path: path}, func() error {
-				var scanErr error
-				found, scanErr = scanFile(agent, path)
-				return scanErr
-			})
+			// Discovery only lists candidates. The selected credential is read
+			// again under the source lock before it is used.
+			found, err := scanFile(agent, path)
 			if err != nil {
 				problems = append(problems, fmt.Errorf("read %s credentials at %s: %w", agent, path, err))
 			}
@@ -147,14 +144,17 @@ func Get(agent, provider, path string) (Source, error) {
 	return decodeEntry(agent, provider, path, raw)
 }
 
-// WithLock uses proper-lockfile's auth.json.lock convention. Pi honors this
-// lock directly; the heartbeat also prevents a long OAuth refresh going stale.
+// WithLock coordinates with the source agent's credential lock.
 func WithLock(source Source, fn func() error) error {
 	lockTarget := source.Path
 	if resolved, err := filepath.EvalSymlinks(source.Path); err == nil {
 		lockTarget = resolved
 	}
 	lockPath := lockTarget + ".lock"
+	if source.Agent == "codex" {
+		return withCodexLock(lockPath, fn)
+	}
+	// Pi uses proper-lockfile. Keep its directory lock current during refresh.
 	deadline := time.Now().Add(35 * time.Second)
 	var owned os.FileInfo
 	for {
@@ -212,6 +212,42 @@ func WithLock(source Source, fn func() error) error {
 		}
 	}
 	return err
+}
+
+func withCodexLock(path string, fn func() error) error {
+	// Older Macaz versions used a directory at this path. Only retire an
+	// empty, expired directory. Codex's regular lock file is permanent.
+	if info, err := os.Lstat(path); err == nil && info.IsDir() {
+		if time.Since(info.ModTime()) <= 35*time.Second {
+			return errors.New("Codex credentials are locked by an older Macaz process")
+		}
+		current, err := os.Lstat(path)
+		if err != nil || !os.SameFile(info, current) || !info.ModTime().Equal(current.ModTime()) {
+			return errors.New("Codex credential lock changed; retry")
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove expired Macaz credential lock directory: %w", err)
+		}
+	}
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("open Codex credential lock: %w", err)
+	}
+	defer file.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		locked, err := tryCodexFileLock(file)
+		if err != nil {
+			return fmt.Errorf("lock Codex credentials: %w", err)
+		}
+		if locked {
+			return fn()
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for Codex credential lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // UpdateOAuth must run under WithLock. expectedRefresh prevents a stale refresh

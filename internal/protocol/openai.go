@@ -308,6 +308,12 @@ func ToResponses(req *Request, model, defaultEffort string) (ResponsesRequest, e
 		body["tool_choice"] = choice
 	}
 	effort := Effort(req, defaultEffort)
+	if IsGPT62Model(model) && (effort == "none" || effort == "minimal") {
+		effort = "low"
+	}
+	if strings.HasPrefix(model, "openai/") && IsGPT62Model(model) && effort == "ultra" {
+		effort = "max"
+	}
 	if len(req.Thinking) > 0 || effort != "" {
 		body["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
 		body["include"] = []string{"reasoning.encrypted_content"}
@@ -325,6 +331,11 @@ func ToResponses(req *Request, model, defaultEffort string) (ResponsesRequest, e
 		}
 	}
 	return ResponsesRequest{Body: body, ToolNames: names}, nil
+}
+
+func IsGPT62Model(model string) bool {
+	model = strings.TrimPrefix(strings.ToLower(strings.TrimSpace(model)), "openai/")
+	return strings.HasPrefix(model, "gpt-6.2-")
 }
 
 const readOffsetGuidance = "Codex Read guidance: offset is an optional zero-based continuation index. Use it only after a prior Read of the same file returned content and more lines are needed. Compute it as the prior offset plus returned line count; line numbers, byte counts, token counts, file sizes, and guessed positions are invalid offsets. Omit offset and limit when opening a file or when unsure."

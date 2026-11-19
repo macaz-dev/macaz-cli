@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	ClientClaude = "claude"
-	ClientCodex  = "codex"
+	ClientClaude       = "claude"
+	ClientCodex        = "codex"
+	defaultOpenAIModel = "gpt-6.2-sol"
 
 	ProviderOpenAISubscription = "openai-subscription"
 	ProviderOpenAIAPIKey       = "openai-api-key"
@@ -76,17 +77,17 @@ func Default() Config {
 		CodexExecutable:    "codex",
 		OpenCodeExecutable: "opencode",
 		OpenAIBaseURL:      "https://api.openai.com/v1",
-		OpenAIModel:        "gpt-5.6",
+		OpenAIModel:        defaultOpenAIModel,
 		OpenRouterBaseURL:  "https://openrouter.ai/api/v1",
-		OpenRouterModel:    "openai/gpt-5.6-sol",
+		OpenRouterModel:    "openai/" + defaultOpenAIModel,
 		AnthropicBaseURL:   "https://api.anthropic.com/v1",
 		AnthropicModel:     "",
 		DefaultEffort:      "medium",
 		ModelMap: map[string]string{
-			"default": "gpt-5.6",
-			"opus":    "gpt-5.6",
-			"sonnet":  "gpt-5.6",
-			"haiku":   "gpt-5.6",
+			"default": defaultOpenAIModel,
+			"opus":    defaultOpenAIModel,
+			"sonnet":  defaultOpenAIModel,
+			"haiku":   defaultOpenAIModel,
 		},
 		RequestTimeoutSec:         7200,
 		MaxConcurrentCLI:          4,

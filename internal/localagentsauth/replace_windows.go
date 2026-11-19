@@ -2,7 +2,12 @@
 
 package localagentsauth
 
-import "golang.org/x/sys/windows"
+import (
+	"errors"
+	"os"
+
+	"golang.org/x/sys/windows"
+)
 
 func replaceFile(source, destination string) error {
 	sourcePtr, err := windows.UTF16PtrFromString(source)
@@ -18,4 +23,14 @@ func replaceFile(source, destination string) error {
 		destinationPtr,
 		windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH,
 	)
+}
+
+func tryCodexFileLock(file *os.File) (bool, error) {
+	err := windows.LockFileEx(windows.Handle(file.Fd()),
+		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0,
+		^uint32(0), ^uint32(0), &windows.Overlapped{})
+	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+		return false, nil
+	}
+	return err == nil, err
 }

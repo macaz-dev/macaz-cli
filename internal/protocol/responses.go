@@ -14,6 +14,7 @@ type ResponsesInput struct {
 	Input              json.RawMessage `json:"input"`
 	Tools              json.RawMessage `json:"tools,omitempty"`
 	ToolChoice         json.RawMessage `json:"tool_choice,omitempty"`
+	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
 	MaxOutputTokens    int             `json:"max_output_tokens,omitempty"`
 	Temperature        *float64        `json:"temperature,omitempty"`
@@ -48,6 +49,19 @@ func FromResponses(input ResponsesInput) (*Request, error) {
 	choice, err := responseToolChoice(input.ToolChoice)
 	if err != nil {
 		return nil, err
+	}
+	if input.ParallelToolCalls != nil && !*input.ParallelToolCalls {
+		policy := map[string]any{"type": "auto"}
+		if len(choice) > 0 {
+			if err := json.Unmarshal(choice, &policy); err != nil {
+				return nil, err
+			}
+		}
+		policy["disable_parallel_tool_use"] = true
+		choice, err = json.Marshal(policy)
+		if err != nil {
+			return nil, err
+		}
 	}
 	request := &Request{
 		Model:          strings.TrimSpace(input.Model),
@@ -476,12 +490,6 @@ func responseEffort(raw json.RawMessage) json.RawMessage {
 		return nil
 	}
 	effort := strings.ToLower(strings.TrimSpace(reasoning.Effort))
-	switch effort {
-	case "none", "minimal":
-		effort = "low"
-	case "xhigh", "ultra":
-		effort = "max"
-	}
 	if effort == "" {
 		return nil
 	}

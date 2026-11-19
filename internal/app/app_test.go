@@ -330,6 +330,11 @@ func TestManualProviderSupportsEndpointAndCustomAuthPath(t *testing.T) {
 }
 
 func TestAnthropicWizardSelectsDefaultFromLiveCatalog(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, "data"))
+	t.Setenv("PI_CODING_AGENT_DIR", filepath.Join(home, "pi"))
+	t.Setenv("CODEX_HOME", filepath.Join(home, "codex"))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" || r.Header.Get("x-api-key") != "wizard-anthropic-key" {
 			http.Error(w, "unexpected request", http.StatusBadRequest)

@@ -331,6 +331,14 @@ func openAIProviderModel(id string, created int64, selected string, metadata ope
 	if official && !likelyOpenAIResponsesModel(id) {
 		return provider.Model{}, false
 	}
+	if official && protocol.IsGPT62Model(id) {
+		return provider.Model{
+			ID: id, DisplayName: id, Default: id == selected, Created: created,
+			Efforts: openAIEfforts(id), InputModalities: []string{"text", "image", "file"},
+			OutputModalities: []string{"text"}, ContextWindow: 1050000, MaxOutputTokens: 128000,
+			ToolCall: true, StructuredOutput: true, Attachment: true,
+		}, true
+	}
 	return provider.Model{
 		ID:               id,
 		DisplayName:      id,
@@ -403,6 +411,9 @@ func likelyOpenAIResponsesModel(id string) bool {
 
 func openAIEfforts(model string) []string {
 	lower := strings.ToLower(model)
+	if strings.HasPrefix(lower, "gpt-6-") || strings.HasPrefix(lower, "gpt-6.") {
+		return []string{"low", "medium", "high", "xhigh", "max"}
+	}
 	if strings.Contains(lower, "gpt-5") || strings.Contains(lower, "o1") ||
 		strings.Contains(lower, "o3") || strings.Contains(lower, "o4") {
 		return []string{"minimal", "low", "medium", "high", "xhigh", "max"}
@@ -509,7 +520,7 @@ func (p *Provider) subscriptionModels(ctx context.Context) ([]provider.Model, er
 
 func (p *Provider) Generate(ctx context.Context, req *protocol.Request, emit protocol.EmitFunc) (protocol.Result, error) {
 	model := p.cfg.ResolveModel(req.Model)
-	translated, err := protocol.ToResponses(req, model, p.cfg.DefaultEffort)
+	translated, err := p.translateRequest(req, model)
 	if err != nil {
 		return protocol.Result{}, provider.InvalidRequest(err)
 	}
@@ -706,12 +717,31 @@ func responseRetryDelay(header http.Header, attempt int, base time.Duration) tim
 	return min(delay, 30*time.Second)
 }
 
+func (p *Provider) translateRequest(req *protocol.Request, model string) (protocol.ResponsesRequest, error) {
+	translated, err := protocol.ToResponses(req, model, p.cfg.DefaultEffort)
+	if err != nil || p.subscription() || p.mode == ModeCompatible || !protocol.IsGPT62Model(model) {
+		return translated, err
+	}
+	body := translated.Body
+	// GPT-6.2 appends top-level instructions. Use a developer message so
+	// reusable instructions are part of the cacheable conversation prefix.
+	if instructions, ok := body["instructions"].(string); ok {
+		input, _ := body["input"].([]any)
+		body["input"] = append([]any{map[string]any{"role": "developer", "content": instructions}}, input...)
+		delete(body, "instructions")
+	}
+	if reasoning, ok := body["reasoning"].(map[string]any); ok && reasoning["effort"] == "ultra" {
+		reasoning["effort"] = "max"
+	}
+	return translated, nil
+}
+
 func (p *Provider) CountTokens(ctx context.Context, req *protocol.Request) (int, bool, error) {
 	if p.subscription() || p.mode == ModeCompatible {
 		return protocol.EstimateInputTokens(req), true, nil
 	}
 	model := p.cfg.ResolveModel(req.Model)
-	translated, err := protocol.ToResponses(req, model, p.cfg.DefaultEffort)
+	translated, err := p.translateRequest(req, model)
 	if err != nil {
 		return 0, false, provider.InvalidRequest(err)
 	}

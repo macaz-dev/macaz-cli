@@ -23,6 +23,9 @@ policy. OpenRouter may also route requests to an upstream model provider. Users
 must review and configure the retention, training, regional-processing, and
 data-control options offered by their provider.
 
+With the Codex CLI bridge, native image generation sends the image prompt and
+any images selected for editing to OpenAI through Codex.
+
 ## Local storage
 
 macaz stores non-secret provider configuration in the platform configuration
@@ -43,6 +46,10 @@ client state. The Codex profile may link to user-managed skills, plugins,
 prompts, and rules from the normal Codex profile, but it does not copy Codex
 authentication into macaz. The local router does not independently persist
 model request or response bodies.
+
+The Codex CLI bridge links to generated images stored in the Codex profile's
+`generated_images` directory. If Codex returns the image inline, macaz saves
+the image under `generated-images` in the isolated Claude profile.
 
 At Claude startup, macaz imports user- and local-scoped MCP server definitions
 from the normal Claude Code state into the isolated Claude profile. It does not

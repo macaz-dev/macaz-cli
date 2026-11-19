@@ -2,8 +2,21 @@
 
 package localagentsauth
 
-import "os"
+import (
+	"errors"
+	"os"
+
+	"golang.org/x/sys/unix"
+)
 
 func replaceFile(source, destination string) error {
 	return os.Rename(source, destination)
+}
+
+func tryCodexFileLock(file *os.File) (bool, error) {
+	err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EINTR) {
+		return false, nil
+	}
+	return err == nil, err
 }

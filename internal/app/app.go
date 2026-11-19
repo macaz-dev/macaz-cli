@@ -198,6 +198,7 @@ func runClient(ctx context.Context, client string, args []string, streams Stream
 	if err != nil {
 		return err
 	}
+	_, _ = fmt.Fprintf(streams.Err, "macaz: checking %s provider %s…\n", client, cfg.Provider)
 	upstream, err := makeProvider(cfg)
 	if err != nil {
 		return err
@@ -336,10 +337,12 @@ func runDoctor(ctx context.Context, client string, streams Streams) error {
 		executable = cfg.CodexExecutable
 		label = "Codex"
 	}
-	if err := checkExecutable(ctx, executable); err != nil {
+	version, err := executableVersion(ctx, executable)
+	if err != nil {
 		return fmt.Errorf("%s executable: %w", label, err)
 	}
 	_, _ = fmt.Fprintf(streams.Out, "%s executable: %s\n", label, executable)
+	_, _ = fmt.Fprintf(streams.Out, "%s version: %s\n", label, version)
 	upstream, err := makeProvider(cfg)
 	if err != nil {
 		return err
@@ -774,16 +777,18 @@ func makeProvider(cfg config.Config) (provider.Provider, error) {
 	}
 }
 
-func checkExecutable(ctx context.Context, name string) error {
+func executableVersion(ctx context.Context, name string) (string, error) {
 	path, err := exec.LookPath(name)
 	if err != nil {
-		return err
+		return "", err
 	}
 	command := exec.CommandContext(ctx, path, "--version")
-	if output, err := command.CombinedOutput(); err != nil {
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	output, err := command.CombinedOutput()
+	version := strings.TrimSpace(string(output))
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, version)
 	}
-	return nil
+	return version, nil
 }
 
 func usage(out io.Writer) {

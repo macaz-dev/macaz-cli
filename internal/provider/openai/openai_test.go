@@ -458,6 +458,29 @@ func TestOfficialOpenAIBaseURLRecognition(t *testing.T) {
 	}
 }
 
+func TestGPT62RequestUsesDeveloperPrefixAndSupportedEffort(t *testing.T) {
+	p := &Provider{mode: ModeAPIKey, cfg: config.Default()}
+	req := &protocol.Request{
+		System:   json.RawMessage(`"stable instructions"`),
+		Messages: []protocol.Message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+	}
+	for requested, want := range map[string]string{"minimal": "low", "xhigh": "xhigh", "ultra": "max"} {
+		p.cfg.DefaultEffort = requested
+		translated, err := p.translateRequest(req, "gpt-6.2-sol")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := translated.Body
+		first := body["input"].([]any)[0].(map[string]any)
+		if body["instructions"] != nil || first["role"] != "developer" || first["content"] != "stable instructions" {
+			t.Fatalf("unexpected instructions and input: %#v", body)
+		}
+		if got := body["reasoning"].(map[string]any)["effort"]; got != want {
+			t.Fatalf("effort for %s = %v, want %s", requested, got, want)
+		}
+	}
+}
+
 func TestSanitizeSubscriptionRemovesUnsupportedPublicFields(t *testing.T) {
 	body := map[string]any{
 		"store":                true,

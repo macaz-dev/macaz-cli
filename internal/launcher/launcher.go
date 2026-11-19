@@ -41,7 +41,7 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 	if err != nil {
 		return fmt.Errorf("find Claude executable %q: %w", cfg.ClaudeExecutable, err)
 	}
-	profileDir, selectedModel, err := prepareClaudeProfile(cfg, options.Models, options.DefaultModel)
+	profileDir, selectedModel, err := prepareClaudeProfile(cfg, options.Models, options.DefaultModel, options.ModelDetails...)
 	if err != nil {
 		return fmt.Errorf("prepare isolated Claude profile: %w", err)
 	}
@@ -54,7 +54,7 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 	command.Stdout = firstWriter(options.Stdout, os.Stdout)
 	command.Stderr = firstWriter(options.Stderr, os.Stderr)
 	configureGracefulShutdown(command)
-	compactWindow := claudeAutoCompactWindow(launchModel, options.ModelDetails)
+	contextWindow := claudeContextWindow(launchModel, options.ModelDetails)
 	baseEnvironment := os.Environ()
 	overrides := map[string]string{
 		"ANTHROPIC_BASE_URL":   options.BaseURL,
@@ -82,8 +82,13 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 		"CLAUDE_CONFIG_DIR":                          profileDir,
 		"MACAZ_ACTIVE":                               "1",
 	}
-	if compactWindow != "" {
-		overrides["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = compactWindow
+	if contextWindow > 0 {
+		overrides["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = strconv.FormatInt(contextWindow, 10)
+		// The client only accepts auto-compact overrides between 100k and 1M.
+		// Its context window can still be set outside that range.
+		if contextWindow >= 100000 {
+			overrides["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = strconv.FormatInt(min(contextWindow, 1000000), 10)
+		}
 	}
 	if shouldEnableClaudeEffort(launchModel, options.ModelDetails, baseEnvironment) {
 		overrides["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
@@ -100,13 +105,13 @@ func Claude(ctx context.Context, cfg config.Config, options Options) error {
 	return nil
 }
 
-func claudeAutoCompactWindow(selected string, models []provider.Model) string {
+func claudeContextWindow(selected string, models []provider.Model) int64 {
 	for _, model := range models {
 		if model.ID == selected && model.ContextWindow > 0 {
-			return strconv.FormatInt(model.ContextWindow, 10)
+			return model.ContextWindow
 		}
 	}
-	return ""
+	return 0
 }
 
 func shouldEnableClaudeEffort(selected string, models []provider.Model, environment []string) bool {
@@ -156,7 +161,7 @@ func terminalFile(writer io.Writer) *os.File {
 	return file
 }
 
-func prepareClaudeProfile(cfg config.Config, models []string, defaultModel string) (string, string, error) {
+func prepareClaudeProfile(cfg config.Config, models []string, defaultModel string, details ...provider.Model) (string, string, error) {
 	profileDir, err := config.ClaudeProfileDir()
 	if err != nil {
 		return "", "", err
@@ -200,6 +205,10 @@ func prepareClaudeProfile(cfg config.Config, models []string, defaultModel strin
 	selectedModel, err := configureGatewayModels(settings, models, defaultModel)
 	if err != nil {
 		return "", "", err
+	}
+	settings["modelPicker"] = map[string]any{
+		"options":               claudePickerOptions(models, details),
+		"replaceBuiltInOptions": true,
 	}
 	if err := config.WritePrivateJSON(settingsPath, settings); err != nil {
 		return "", "", err
@@ -755,6 +764,27 @@ func gatewayArgs(args, models []string, selected string) ([]string, string, erro
 	}
 	result = append([]string{"--managed-settings", string(managed)}, result...)
 	return result, launchModel, nil
+}
+
+func claudePickerOptions(models []string, details []provider.Model) []map[string]string {
+	byID := make(map[string]provider.Model, len(details))
+	for _, model := range details {
+		byID[model.ID] = model
+	}
+	options := make([]map[string]string, 0, len(models))
+	for _, id := range models {
+		row := map[string]string{"model": id}
+		if model, ok := byID[id]; ok {
+			if model.DisplayName != "" {
+				row["label"] = model.DisplayName
+			}
+			if model.Description != "" {
+				row["description"] = strings.Join(strings.Fields(model.Description), " ")
+			}
+		}
+		options = append(options, row)
+	}
+	return options
 }
 
 func resolveLaunchModel(requested string, allowed map[string]bool, selected string) (string, error) {

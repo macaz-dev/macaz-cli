@@ -7,6 +7,7 @@ import (
 )
 
 func TestFromResponsesMapsCodexConversationToolsAndAttachments(t *testing.T) {
+	parallel := false
 	input := ResponsesInput{
 		Model:        "macaz-model",
 		Instructions: json.RawMessage(`"base instructions"`),
@@ -17,7 +18,8 @@ func TestFromResponsesMapsCodexConversationToolsAndAttachments(t *testing.T) {
 			"type":"function","name":"Read","description":"Read a file",
 			"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
 		}]`),
-		ToolChoice: json.RawMessage(`"required"`),
+		ToolChoice:        json.RawMessage(`"required"`),
+		ParallelToolCalls: &parallel,
 		Input: json.RawMessage(`[
 			{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer policy"}]},
 			{"type":"message","role":"user","content":[
@@ -45,10 +47,10 @@ func TestFromResponsesMapsCodexConversationToolsAndAttachments(t *testing.T) {
 	if system != "base instructions\n\ndeveloper policy" {
 		t.Fatalf("system = %q", system)
 	}
-	if string(req.ToolChoice) != `{"type":"any"}` {
+	if string(req.ToolChoice) != `{"disable_parallel_tool_use":true,"type":"any"}` {
 		t.Fatalf("tool choice = %s", req.ToolChoice)
 	}
-	if !strings.Contains(string(req.OutputConfig), `"effort":"max"`) {
+	if !strings.Contains(string(req.OutputConfig), `"effort":"xhigh"`) {
 		t.Fatalf("output config = %s", req.OutputConfig)
 	}
 	if len(req.Messages) != 3 {
