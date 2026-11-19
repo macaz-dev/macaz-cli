@@ -472,7 +472,7 @@ func (s *Server) installModels(models []provider.Model) ModelCatalog {
 		catalog.Models[index].ID = catalog.IDs[index]
 		catalog.UpstreamByID[catalog.IDs[index]] = model.ID
 		s.models[catalog.IDs[index]] = model
-		if catalog.Default == "" && (model.Default || strings.EqualFold(strings.TrimSpace(model.ID), selected)) {
+		if strings.EqualFold(strings.TrimSpace(model.ID), selected) || (catalog.Default == "" && model.Default) {
 			catalog.Default = catalog.IDs[index]
 			catalog.DefaultUpstream = model.ID
 		}

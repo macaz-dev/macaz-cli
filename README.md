@@ -111,6 +111,7 @@ export MACAZ_NO_UPDATE_CHECK=1
 - A browser is used by the OpenAI Subscription authorization flow.
 
 Claude Code, Codex CLI, and OpenCode are not bundled or redistributed.
+Compatibility was checked with Claude Code 2.1.328 and Codex CLI 0.170.0.
 
 ## Setup and providers
 
@@ -158,13 +159,18 @@ so model selection works through Claude Code's or Codex CLI's native `/model`
 interface. The configured provider default is selected at launch; interactive
 changes follow the selected client's normal session behavior.
 
+New OpenAI API and OpenRouter profiles start with GPT-6.2 Sol. The live
+catalog can include GPT-6.2 Astra and, with Anthropic API or OpenRouter, Claude
+Opus 5.5, Sonnet 5.5, Haiku 5.5, and Fable 5.2, depending on account access.
+Existing configurations retain their saved model IDs.
+
 ## Commands
 
 ```text
 macaz claude [args...]    Start Claude Code
 macaz codex [args...]     Start Codex CLI
 macaz status [client]     Check the configured provider and model catalog
-macaz doctor [client]     Check the client executable and provider
+macaz doctor [client]     Show the client version and check the provider
 macaz reset [client]      Reset one client, or all macaz state when omitted
 macaz legal               Show the compatibility notice
 macaz update              Install the latest verified release
@@ -270,23 +276,29 @@ The isolated profiles may contain client-owned session history. See
 - Anthropic API uses native `/v1/models`, `/v1/messages`, and
   `/v1/messages/count_tokens`. Responses custom tools are converted to normal
   Anthropic tools with a typed raw-input wrapper and converted back before
-  Codex executes them.
-- Codex CLI as a provider uses `codex app-server` only as the authenticated
-  transport and is offered only to the Claude client; using Codex as both
-  client and upstream would recurse. Macaz derives a private temporary model
+  Codex executes them. JSON schemas are passed in `output_config.format`.
+  Models such as Claude Opus 5.5 and Sonnet 5.5 require automatic tool choice.
+- The Claude client can use `codex app-server` for authenticated inference
+  and native image generation. Macaz derives a private temporary model
   catalog from Codex's local model caches, including the default profile,
   `CODEX_HOME`, sibling profiles, and profiles reported by wrapper executables.
   Malformed cache revisions are skipped when another valid profile is
   available; `MACAZ_CODEX_MODEL_CATALOG` can explicitly select a fully custom
   catalog path. Macaz normalizes supported Codex catalog schema revisions,
   selects direct tool calling, disables Codex execution environments, and
-  leaves every source cache unchanged. Claude
-  executes client tools and macaz returns each structured result to the same
+  leaves every source cache unchanged. Claude executes client tools and macaz
+  returns each structured result to the same
   app-server thread. Pending turns are isolated by Claude session and agent and
   expire after five minutes. Macaz reserves one CLI slot for new traffic;
   excess pending turns use the safe interrupted-turn fallback instead of
   starving the pool. If the Codex model cache is missing, run Codex once before
   using this experimental bridge.
+- For Claude sessions on the Codex CLI bridge, ask for a PNG to use Codex's
+  native image generator when the model and account support it. Claude shows a
+  link to the generated file. Attach an image to edit it. Claude handles local
+  file reads and writes with its own permissions, and macaz forwards image
+  attachments and extracts text from supported documents. Image-only PDFs
+  require a vision-capable file reader or OCR in the client.
 - OpenCode CLI uses an isolated request-scoped provider configuration. Its
   project tools and context are not exposed as a second agent layer.
 - Local agent auth bypasses the source agent runtime and uses a selected Codex,
@@ -299,10 +311,11 @@ The isolated profiles may contain client-owned session history. See
   to four concurrent upstream requests by default. Advanced users can change
   `max_concurrent_subscription_requests` in `config.json`.
 - Macaz keeps the exact selected model for main, background, classifier, and
-  subagent paths. It sets Claude's automatic compact window only when the active
-  provider reports a context limit, and caps reasoning effort only for Claude's
-  dedicated conversation-compaction request. The default reasoning effort is
-  `medium` and can be changed with `default_effort` in `config.json`.
+  subagent paths. For Claude Code, it uses the launch model's reported context
+  limit to size the session and set the automatic compact window. It caps
+  reasoning effort for Claude's dedicated conversation-compaction request. The
+  default reasoning effort is `medium` and can be changed with `default_effort`
+  in `config.json`.
 
 ## Local development
 

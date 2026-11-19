@@ -289,10 +289,37 @@ func TestNativeToolDetection(t *testing.T) {
 			t.Fatalf("%q should be forbidden", item)
 		}
 	}
-	for _, item := range []string{"", "userMessage", "agentMessage", "reasoning", "dynamicToolCall"} {
+	for _, item := range []string{"", "userMessage", "agentMessage", "reasoning", "dynamicToolCall", "imageGeneration"} {
 		if isNativeTool(item) {
 			t.Fatalf("%q must be allowed", item)
 		}
+	}
+}
+
+func TestGeneratedImageUsesCodexArtifactOrSavesInlineResult(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("MACAZ_CONFIG", filepath.Join(root, "config.json"))
+	dir := filepath.Join(root, "generated_images", "test-thread")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	image := liveTestImage(t)
+	path := filepath.Join(dir, "generated.png")
+	if err := os.WriteFile(path, image, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := generatedImagePath(map[string]any{"savedPath": path}, "test-thread"); err != nil || got != path {
+		t.Fatalf("native artifact = %q, %v", got, err)
+	}
+	if _, err := generatedImagePath(map[string]any{"savedPath": path}, "different-thread"); err == nil {
+		t.Fatal("accepted an artifact from a different thread")
+	}
+	fallback, err := generatedImagePath(map[string]any{"result": base64.StdEncoding.EncodeToString(image)}, "test-thread")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(fallback); err != nil || !bytes.Equal(got, image) {
+		t.Fatalf("inline image artifact was not saved: %v", err)
 	}
 }
 

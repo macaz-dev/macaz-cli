@@ -192,7 +192,7 @@ func codexCatalogModel(model provider.Model, isDefault bool, priority int, effor
 }
 
 func codexDefaultReasoningLevel(levels []map[string]string, configured string) string {
-	configured = codexEffort(configured)
+	configured = strings.ToLower(strings.TrimSpace(configured))
 	first := "high"
 	for index, level := range levels {
 		value := level["effort"]
@@ -228,13 +228,17 @@ func codexReasoningLevels(efforts []string) []map[string]string {
 	seen := map[string]bool{}
 	result := make([]map[string]string, 0, len(efforts))
 	for _, effort := range efforts {
-		normalized := codexEffort(effort)
+		normalized := strings.ToLower(strings.TrimSpace(effort))
 		if seen[normalized] {
 			continue
 		}
 		seen[normalized] = true
-		description := "Provider-specific reasoning level"
+		var description string
 		switch normalized {
+		case "none":
+			description = "Respond without reasoning"
+		case "minimal":
+			description = "Use minimal reasoning"
 		case "low":
 			description = "Fast responses with lighter reasoning"
 		case "medium":
@@ -242,24 +246,17 @@ func codexReasoningLevels(efforts []string) []map[string]string {
 		case "high":
 			description = "Greater reasoning depth for complex work"
 		case "xhigh":
-			description = "Maximum provider reasoning where available"
+			description = "Extra high reasoning depth"
+		case "max":
+			description = "Maximum reasoning depth"
+		case "ultra":
+			description = "Use the provider's ultra reasoning level"
+		default:
+			continue
 		}
 		result = append(result, map[string]string{"effort": normalized, "description": description})
 	}
 	return result
-}
-
-func codexEffort(effort string) string {
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "none", "minimal", "low":
-		return "low"
-	case "medium":
-		return "medium"
-	case "xhigh", "max", "ultra":
-		return "xhigh"
-	default:
-		return "high"
-	}
 }
 
 func codexGatewayArgs(args []string, options Options, catalogPath, effort string) ([]string, error) {
@@ -287,11 +284,20 @@ func codexGatewayArgs(args []string, options Options, catalogPath, effort string
 		}
 	}
 	baseURL := strings.TrimRight(options.BaseURL, "/") + "/v1"
+	for _, model := range options.ModelDetails {
+		if model.ID == options.DefaultModel {
+			levels := codexReasoningLevels(model.Efforts)
+			if len(levels) > 0 {
+				effort = codexDefaultReasoningLevel(levels, effort)
+			}
+			break
+		}
+	}
 	overrides := []string{
 		fmt.Sprintf("model=%q", options.DefaultModel),
 		`model_provider="macaz"`,
 		fmt.Sprintf("model_catalog_json=%q", catalogPath),
-		fmt.Sprintf("model_reasoning_effort=%q", codexEffort(effort)),
+		fmt.Sprintf("model_reasoning_effort=%q", effort),
 		`web_search="disabled"`,
 		`model_providers.macaz.name="Macaz local connection"`,
 		fmt.Sprintf("model_providers.macaz.base_url=%q", baseURL),

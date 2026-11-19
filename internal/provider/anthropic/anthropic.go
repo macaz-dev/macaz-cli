@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -155,11 +156,8 @@ func (p *Provider) Models(ctx context.Context) ([]provider.Model, error) {
 		if thinking {
 			parameters = append(parameters, "thinking")
 		}
-		if len(efforts) > 0 {
+		if len(efforts) > 0 || structuredOutputs {
 			parameters = append(parameters, "output_config")
-		}
-		if structuredOutputs {
-			parameters = append(parameters, "output_format")
 		}
 		contextWindow := item.MaxInputTokens
 		if contextWindow <= 0 {
@@ -205,7 +203,9 @@ func (p *Provider) Generate(ctx context.Context, request *protocol.Request, emit
 	if req.Model == "" {
 		req.Model = p.cfg.ResolveModel("default")
 	}
-	p.configureAnthropicRequest(req)
+	if err := p.configureAnthropicRequest(req); err != nil {
+		return protocol.Result{}, provider.InvalidRequest(err)
+	}
 	if req.MaxTokens <= 0 {
 		if model, ok := p.modelInfo(req.Model); ok && model.MaxOutputTokens > 0 {
 			req.MaxTokens = int(model.MaxOutputTokens)
@@ -259,9 +259,19 @@ func (p *Provider) CountTokens(ctx context.Context, request *protocol.Request) (
 	if req.Model == "" {
 		req.Model = p.cfg.ResolveModel("default")
 	}
-	p.configureAnthropicRequest(req)
-	req.Stream = false
-	raw, err := json.Marshal(req)
+	if err := p.configureAnthropicRequest(req); err != nil {
+		return 0, false, provider.InvalidRequest(err)
+	}
+	raw, err := json.Marshal(struct {
+		Model             string             `json:"model"`
+		Messages          []protocol.Message `json:"messages"`
+		System            json.RawMessage    `json:"system,omitempty"`
+		Tools             []protocol.Tool    `json:"tools,omitempty"`
+		ToolChoice        json.RawMessage    `json:"tool_choice,omitempty"`
+		Thinking          json.RawMessage    `json:"thinking,omitempty"`
+		OutputConfig      json.RawMessage    `json:"output_config,omitempty"`
+		ContextManagement json.RawMessage    `json:"context_management,omitempty"`
+	}{req.Model, req.Messages, req.System, req.Tools, req.ToolChoice, req.Thinking, req.OutputConfig, req.ContextManagement})
 	if err != nil {
 		return 0, false, err
 	}
@@ -294,18 +304,12 @@ func (p *Provider) CountTokens(ctx context.Context, request *protocol.Request) (
 	return payload.InputTokens, false, nil
 }
 
-func (p *Provider) configureAnthropicRequest(req *protocol.Request) {
+func (p *Provider) configureAnthropicRequest(req *protocol.Request) error {
+	efforts := anthropicEfforts(req.Model)
 	if model, ok := p.modelInfo(req.Model); ok {
-		if len(model.Efforts) == 0 {
-			req.OutputConfig = nil
-			return
-		}
-		if len(req.OutputConfig) > 0 && len(req.Thinking) == 0 && anthropicUsesAdaptiveThinking(req.Model) {
-			req.Thinking = json.RawMessage(`{"type":"adaptive"}`)
-		}
-		return
+		efforts = model.Efforts
 	}
-	configureAnthropicRequest(req)
+	return configureAnthropicRequest(req, efforts)
 }
 
 func (p *Provider) modelInfo(id string) (provider.Model, bool) {
@@ -342,21 +346,90 @@ func capabilityEfforts(capabilities *modelCapabilities) []string {
 	return result
 }
 
-func configureAnthropicRequest(req *protocol.Request) {
-	if len(anthropicEfforts(req.Model)) == 0 {
-		req.OutputConfig = nil
-		return
+func configureAnthropicRequest(req *protocol.Request, efforts []string) error {
+	model := normalizedModelID(req.Model)
+	policy, err := protocol.ParseToolPolicy(req.ToolChoice)
+	if err != nil {
+		return err
 	}
-	if len(req.OutputConfig) > 0 && len(req.Thinking) == 0 && anthropicUsesAdaptiveThinking(req.Model) {
+	if (policy.Type == "tool" || policy.Type == "any") && containsAny(model,
+		"opus-5-5", "sonnet-5-5", "fable-5-1", "fable-5-2", "mythos-5-1", "mythos-5-2") {
+		return fmt.Errorf("%s does not support forced tool choice; use auto tool choice", req.Model)
+	}
+	settings := map[string]json.RawMessage{}
+	if len(req.OutputConfig) > 0 {
+		if err := json.Unmarshal(req.OutputConfig, &settings); err != nil {
+			return fmt.Errorf("decode output_config: %w", err)
+		}
+		if settings == nil {
+			settings = map[string]json.RawMessage{}
+		}
+	}
+	if len(req.OutputFormat) > 0 && len(settings["format"]) == 0 {
+		var format struct {
+			Type   string          `json:"type"`
+			Schema json.RawMessage `json:"schema"`
+		}
+		if err := json.Unmarshal(req.OutputFormat, &format); err != nil {
+			return fmt.Errorf("decode output format: %w", err)
+		}
+		if format.Type != "json_schema" || len(format.Schema) == 0 {
+			return errors.New("Anthropic output format requires a JSON schema")
+		}
+		settings["format"], _ = json.Marshal(format)
+	}
+	req.OutputFormat = nil
+	if effort, ok := settings["effort"]; ok {
+		var requested string
+		if err := json.Unmarshal(effort, &requested); err != nil {
+			return fmt.Errorf("decode output_config.effort: %w", err)
+		}
+		if supported := supportedAnthropicEffort(requested, efforts); supported != "" {
+			settings["effort"], _ = json.Marshal(supported)
+		} else {
+			delete(settings, "effort")
+		}
+	}
+	req.OutputConfig = nil
+	if len(settings) > 0 {
+		req.OutputConfig, err = json.Marshal(settings)
+		if err != nil {
+			return err
+		}
+	}
+	if len(settings["effort"]) > 0 && len(req.Thinking) == 0 && anthropicUsesAdaptiveThinking(model) &&
+		policy.Type != "tool" && policy.Type != "any" {
 		req.Thinking = json.RawMessage(`{"type":"adaptive"}`)
 	}
+	return nil
+}
+
+func supportedAnthropicEffort(requested string, supported []string) string {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	switch requested {
+	case "none", "minimal":
+		requested = "low"
+	case "ultra":
+		requested = "max"
+	}
+	levels := []string{"low", "medium", "high", "xhigh", "max"}
+	index := slices.Index(levels, requested)
+	if index < 0 || len(supported) == 0 {
+		return ""
+	}
+	for i := index; i >= 0; i-- {
+		if slices.Contains(supported, levels[i]) {
+			return levels[i]
+		}
+	}
+	return supported[0]
 }
 
 func anthropicEfforts(model string) []string {
 	model = normalizedModelID(model)
 	switch {
 	case containsAny(model,
-		"fable-5", "mythos-5", "opus-4-8", "opus-4-7", "sonnet-5"):
+		"fable-5", "mythos-5", "opus-5", "haiku-5-5", "opus-4-8", "opus-4-7", "sonnet-5"):
 		return []string{"low", "medium", "high", "xhigh", "max"}
 	case containsAny(model, "opus-4-6", "sonnet-4-6"):
 		return []string{"low", "medium", "high", "max"}
@@ -369,12 +442,15 @@ func anthropicEfforts(model string) []string {
 
 func anthropicUsesAdaptiveThinking(model string) bool {
 	model = normalizedModelID(model)
-	return containsAny(model, "opus-4-6", "sonnet-4-6", "opus-4-7", "opus-4-8")
+	return containsAny(model, "opus-4-6", "sonnet-4-6", "opus-4-7", "opus-4-8",
+		"fable-5", "mythos-5", "opus-5", "haiku-5-5", "sonnet-5")
 }
 
 func anthropicDefaultMaxTokens(model string) int {
 	model = normalizedModelID(model)
 	switch {
+	case containsAny(model, "opus-5-5", "sonnet-5-5", "haiku-5-5", "fable-5-2", "mythos-5-2"):
+		return 128000
 	case strings.Contains(model, "3-5"):
 		return 8192
 	case strings.Contains(model, "-5"), strings.Contains(model, "-4-"), strings.Contains(model, "3-7"):

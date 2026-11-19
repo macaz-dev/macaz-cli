@@ -27,6 +27,11 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 		case "/v1/models":
 			_, _ = io.WriteString(w, `{"data":[{"id":"claude-test","display_name":"Claude Test","created_at":"2026-01-02T03:04:05Z","max_input_tokens":1000000,"max_tokens":128000,"capabilities":{"effort":{"supported":true,"low":{"supported":true},"medium":{"supported":false},"high":{"supported":true},"xhigh":{"supported":false},"max":{"supported":false}},"image_input":{"supported":true},"pdf_input":{"supported":false},"structured_outputs":{"supported":true},"thinking":{"supported":true}}}],"has_more":false}`)
 		case "/v1/messages/count_tokens":
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body["max_tokens"] != nil || body["stream"] != nil {
+				http.Error(w, "unexpected token count request", http.StatusBadRequest)
+				return
+			}
 			_, _ = io.WriteString(w, `{"input_tokens":17}`)
 		case "/v1/messages":
 			messagesCalls++
@@ -37,6 +42,10 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 			}
 			if request.Model != "claude-test" || !request.Stream || len(request.Tools) != 1 {
 				http.Error(w, fmt.Sprintf("unexpected request: %#v", request), http.StatusBadRequest)
+				return
+			}
+			if len(request.OutputFormat) != 0 || string(request.OutputConfig) != `{"effort":"high","format":{"type":"json_schema","schema":{"type":"object"}}}` {
+				http.Error(w, "unexpected output config: "+string(request.OutputConfig), http.StatusBadRequest)
 				return
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -75,6 +84,7 @@ func TestProviderUsesNativeMessagesModelsAndTokenCount(t *testing.T) {
 		Messages:     []protocol.Message{{Role: "user", Content: json.RawMessage(`"read"`)}},
 		Tools:        []protocol.Tool{{Name: "Read", InputSchema: map[string]any{"type": "object"}}},
 		OutputConfig: json.RawMessage(`{"effort":"max"}`),
+		OutputFormat: json.RawMessage(`{"type":"json_schema","name":"answer","schema":{"type":"object"}}`),
 	}
 	var events []protocol.Event
 	result, err := provider.Generate(context.Background(), request, func(event protocol.Event) error {
@@ -161,6 +171,8 @@ func TestAnthropicModelCapabilitiesAreModelSpecific(t *testing.T) {
 		max      int
 	}{
 		{model: "claude-opus-4-8", efforts: []string{"low", "medium", "high", "xhigh", "max"}, adaptive: true, max: 32000},
+		{model: "claude-opus-5-5", efforts: []string{"low", "medium", "high", "xhigh", "max"}, adaptive: true, max: 128000},
+		{model: "claude-haiku-5-5", efforts: []string{"low", "medium", "high", "xhigh", "max"}, adaptive: true, max: 128000},
 		{model: "claude-sonnet-4-6", efforts: []string{"low", "medium", "high", "max"}, adaptive: true, max: 32000},
 		{model: "claude-opus-4-5", efforts: []string{"low", "medium", "high"}, max: 32000},
 		{model: "claude-3-5-sonnet-latest", max: 8192},
@@ -181,12 +193,16 @@ func TestAnthropicModelCapabilitiesAreModelSpecific(t *testing.T) {
 	}
 
 	request := &protocol.Request{Model: "claude-sonnet-4-6", OutputConfig: json.RawMessage(`{"effort":"max"}`)}
-	configureAnthropicRequest(request)
+	if err := configureAnthropicRequest(request, anthropicEfforts(request.Model)); err != nil {
+		t.Fatal(err)
+	}
 	if string(request.Thinking) != `{"type":"adaptive"}` {
 		t.Fatalf("thinking = %s", request.Thinking)
 	}
 	legacy := &protocol.Request{Model: "claude-3-haiku", OutputConfig: json.RawMessage(`{"effort":"high"}`)}
-	configureAnthropicRequest(legacy)
+	if err := configureAnthropicRequest(legacy, anthropicEfforts(legacy.Model)); err != nil {
+		t.Fatal(err)
+	}
 	if len(legacy.OutputConfig) != 0 {
 		t.Fatalf("legacy output config was retained: %s", legacy.OutputConfig)
 	}

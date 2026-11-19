@@ -179,10 +179,10 @@ func TestClientProfilesRejectRedundantDirectProviders(t *testing.T) {
 func TestResolveModel(t *testing.T) {
 	cfg := Default()
 	tests := map[string]string{
-		"sonnet":                      "gpt-5.6",
-		"claude-sonnet-4-6":           "gpt-5.6",
+		"sonnet":                      "gpt-6.2-sol",
+		"claude-sonnet-4-6":           "gpt-6.2-sol",
 		"custom-openai-model":         "custom-openai-model",
-		"claude-unknown-future-model": "gpt-5.6",
+		"claude-unknown-future-model": "gpt-6.2-sol",
 	}
 	for input, want := range tests {
 		if got := cfg.ResolveModel(input); got != want {

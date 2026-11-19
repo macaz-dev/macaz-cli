@@ -33,7 +33,7 @@ const (
 	accountRefreshSkew       = 60 * time.Second
 	accountCredentialType    = "openai_account_oauth"
 	accountCredentialMethod  = "chatgpt_headless"
-	accountClientVersion     = "0.144.5"
+	accountClientVersion     = "0.170.0"
 )
 
 type DeviceAuthorization struct {
